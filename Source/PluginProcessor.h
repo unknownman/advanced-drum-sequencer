@@ -166,8 +166,8 @@ private:
 
     // Standalone-only internal synthesizer (pre-allocated; never entered in DAW).
     void initialiseDrumSynth (double sampleRate);
-    void renderInternalSynth (juce::AudioBuffer<float>&, int numSamples);
-    void renderDrumVoice (juce::AudioBuffer<float>&, DrumVoice&, int numSamples);
+    void renderInternalSynth (juce::AudioBuffer<float>&, int numSamples, int hwChannels);
+    void renderDrumVoice (juce::AudioBuffer<float>&, DrumVoice&, int numSamples, int hwChannels);
     void triggerDrumVoice (int lane, float velocity01);
     void noteOffDrumVoices ();
     static DrumModel drumModelForLane (int lane);

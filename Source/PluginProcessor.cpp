@@ -325,6 +325,12 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
 
     // Standalone has no transport timeline, so the sequencer must run forever
     // on its own sample-driven virtual playhead at fallbackBpmCache tempo.
+    // Audio-thread hygiene: elapsed time is derived ONLY from the incoming
+    // sample block length + sample rate (never std::chrono / wall clock), so
+    // the PPQ accumulator is sample-accurate across block boundaries.
+    // When a host DAW playhead exists (wrapperType != Standalone) this branch
+    // is never entered and the virtual clock sleeps completely: the plugin
+    // stays 100% processing-neutral inside Ableton Live.
     if (standalone && !isPlaying)
     {
         const double ppqPerSample = bpm / (60.0 * sampleRate * 4.0);
@@ -343,8 +349,19 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
         stopAndFlush (midiMessages);
     }
 
+    // Hardware driver routing: the standalone audio device may expose fewer
+    // channels than the plugin's stereo architecture (e.g. a mono interface).
+    // Clamp the render pass to the channels the driver actually provides and
+    // let renderInternalSynth() downmix the summed stereo program + per-sample
+    // energy clip into them, so the outbound bus is never written out of bounds
+    // and no float accumulation can overflow the driver buffer.
     if (standalone)
-        renderInternalSynth (buffer, numSamples);
+    {
+        const int hwChannels = juce::jlimit (0, 2, buffer.getNumChannels ());
+
+        if (hwChannels > 0)
+            renderInternalSynth (buffer, numSamples, hwChannels);
+    }
 
     wasPlayingLast = isPlaying;
 }
@@ -769,17 +786,19 @@ void PluginAudioProcessor::noteOffDrumVoices ()
             voice.adsr.noteOff ();
 }
 
-void PluginAudioProcessor::renderInternalSynth (juce::AudioBuffer<float>& buffer, int numSamples)
+void PluginAudioProcessor::renderInternalSynth (juce::AudioBuffer<float>& buffer, int numSamples, int hwChannels)
 {
-    if (numSamples <= 0)
+    if (numSamples <= 0 || hwChannels <= 0)
         return;
 
     for (auto& voice : drumVoices)
         if (voice.active)
-            renderDrumVoice (buffer, voice, numSamples);
+            renderDrumVoice (buffer, voice, numSamples, hwChannels);
 
-    // Sum of up to 16 voices must remain within a safe output range.
-    for (int c = 0; c < buffer.getNumChannels (); ++c)
+    // Sum of up to 16 voices must remain within a safe output range. This also
+    // performs the mono downmix: when the device exposes a single channel, the
+    // summed stereo program is energy-clipped into that one hardware line.
+    for (int c = 0; c < hwChannels; ++c)
     {
         auto* channel = buffer.getWritePointer (c);
 
@@ -790,9 +809,10 @@ void PluginAudioProcessor::renderInternalSynth (juce::AudioBuffer<float>& buffer
 
 void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
                                             DrumVoice& voice,
-                                            int numSamples)
+                                            int numSamples,
+                                            int hwChannels)
 {
-    const int numChannels = juce::jmax (1, buffer.getNumChannels ());
+    const int numChannels = juce::jlimit (1, hwChannels, buffer.getNumChannels ());
     const float* const* channels = buffer.getArrayOfWritePointers ();
 
     const double invSampleRate = 1.0 / currentSampleRate;
