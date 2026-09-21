@@ -208,8 +208,17 @@ public:
     juce::AudioProcessorValueTreeState& getAPVTS () noexcept { return apvts; }
 
     static juce::String laneStepVelParameterID (int lane, int step);
+    static juce::String laneStepProbParameterID (int lane, int step);
     static juce::String laneSynthParameterID (int lane, const char* paramName);
+    static juce::String laneEuclideanPulsesParameterID (int lane);
+    static juce::String laneEuclideanStepsParameterID (int lane);
     juce::RangedAudioParameter* getLaneStepVelParameter (int lane, int step);
+
+    // Björklund's Euclidean algorithm: distributes `pulses` onsets as evenly as
+    // possible across `steps` positions (0..31 output; only `steps` entries are
+    // meaningful). A non-allocating group-compaction port of the canonical
+    // reference implementation; callable from the message thread only.
+    static std::array<bool, kAutomationStepCount> computeEuclideanRhythm (int pulses, int steps);
 
     void setStepVelocity (int lane, int step, float value);
     float getStepVelocity (int lane, int step) const;
@@ -280,6 +289,16 @@ private:
     std::array<std::atomic<int>, kNumLanes> currentStepCaches;
     std::array<std::array<std::atomic<int>, kNumLanes>, kNumNoteBanks> noteBankCaches;
     std::array<std::array<std::atomic<float>, kMaxStepsPerLane>, kNumLanes> stepVelocityCaches;
+
+    // Per-step stochastic trigger-probability atomics (lane_[lane]_step_[step]_prob).
+    // Populated in prepareToPlay() exactly like the synth channel pointers; a
+    // failed juce::Random roll in renderLaneHit drops that step's hit.
+    std::array<std::array<std::atomic<float>*, kAutomationStepCount>, kNumLanes> stepProbCaches;
+
+    // Pre-allocated real-time randomness for the probability gates. The member
+    // is only ever touched by the audio thread inside renderLaneHit, so no lock
+    // or TLS juggling is needed.
+    juce::Random probabilityRandom;
 
     std::atomic<int> activeNoteBank { 0 };
     std::atomic<int> mpdLaneBank    { 0 };

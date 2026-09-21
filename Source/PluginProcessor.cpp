@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include <juce_dsp/juce_dsp.h>
 
@@ -87,6 +88,27 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
                 juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f / 127.0f),
                 0.0f,
                 velocityAttributes));
+        }
+
+    // Stochastic humanisation matrix: every step of every lane carries an
+    // automatable trigger probability (default 100%). The APVTS tree gives us
+    // the host-facing 0..100% string for free while the audio thread consumes
+    // the pre-cached atomics against a juce::Random roll in renderLaneHit.
+    const auto probabilityAttributes = juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+        [] (float v, int)
+        {
+            return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 100.0f)) + "%";
+        });
+
+    for (int lane = 0; lane < kNumLanes; ++lane)
+        for (int step = 0; step < kAutomationStepCount; ++step)
+        {
+            layout.add (std::make_unique<juce::AudioParameterFloat> (
+                laneStepProbParameterID (lane, step),
+                "Lane " + juce::String (lane + 1) + " Step " + juce::String (step + 1) + " Probability",
+                juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
+                1.0f,
+                probabilityAttributes));
         }
 
     // Parametric internal-synth engine: 5 automatable configuration params per
@@ -195,6 +217,27 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
                 })));
     }
 
+    // Algorithmic Euclidean macro pair (Björklund pulses/steps) per lane. A
+    // pulses value of 0 disables the generator (lane keeps its manual grid);
+    // the editor listens for changes and commits the generated rhythm into the
+    // lane's 32 step-velocity states as a single host automation gesture.
+    for (int lane = 0; lane < kNumLanes; ++lane)
+    {
+        layout.add (std::make_unique<juce::AudioParameterInt> (
+            laneEuclideanPulsesParameterID (lane),
+            "Lane " + juce::String (lane + 1) + " Euclidean Pulses",
+            0,
+            kAutomationStepCount,
+            0));
+
+        layout.add (std::make_unique<juce::AudioParameterInt> (
+            laneEuclideanStepsParameterID (lane),
+            "Lane " + juce::String (lane + 1) + " Euclidean Steps",
+            1,
+            kAutomationStepCount,
+            16));
+    }
+
     return layout;
 }
 
@@ -206,6 +249,21 @@ juce::String PluginAudioProcessor::laneSynthParameterID (int lane, const char* p
 juce::String PluginAudioProcessor::laneStepVelParameterID (int lane, int step)
 {
     return juce::String::formatted ("lane_%d_step_%d_vel", lane, step);
+}
+
+juce::String PluginAudioProcessor::laneStepProbParameterID (int lane, int step)
+{
+    return juce::String::formatted ("lane_%d_step_%d_prob", lane, step);
+}
+
+juce::String PluginAudioProcessor::laneEuclideanPulsesParameterID (int lane)
+{
+    return juce::String::formatted ("lane_%d_euclidean_pulses", lane);
+}
+
+juce::String PluginAudioProcessor::laneEuclideanStepsParameterID (int lane)
+{
+    return juce::String::formatted ("lane_%d_euclidean_steps", lane);
 }
 
 juce::RangedAudioParameter* PluginAudioProcessor::getLaneStepVelParameter (int lane, int step)
@@ -318,6 +376,13 @@ void PluginAudioProcessor::initialiseDrumSynth (double sampleRate)
         channel.lfoWave    = apvts.getRawParameterValue (laneSynthParameterID (lane, "lfo_wave"));
         channel.noiseBlend = apvts.getRawParameterValue (laneSynthParameterID (lane, "noise_blend"));
     }
+
+    // Pre-cache the 512 stochastic gate atomics (32 per lane) exactly like the
+    // synth channel pointers: stable normalized values, audio-thread load-only.
+    for (int lane = 0; lane < kNumLanes; ++lane)
+        for (int step = 0; step < kAutomationStepCount; ++step)
+            stepProbCaches[(size_t) lane][(size_t) step] =
+                apvts.getRawParameterValue (laneStepProbParameterID (lane, step));
 
     // Exponential pitch-sweep multiplier for the kick model.
     kickPitchStep = std::pow (0.0015, 1.0 / (kSynth.kickPitchTime * sampleRate));
@@ -690,6 +755,20 @@ void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int la
     if (velocity01 <= 0.0f)
         return;
 
+    // Stochastic humanisation gate. renderLaneHit fires exactly once per
+    // absolute 16th boundary, so the roll is evaluated per step-event (never
+    // per sample) against the pre-cached probability atomic. A failed roll
+    // skips both the outgoing noteOn and the internal drum voice, yielding
+    // evolving ghost notes / polyrhythmic drops.
+    const auto* probAtomic = stepProbCaches[(size_t) lane][(size_t) laneStep];
+    const float stepProb   = probAtomic != nullptr ? probAtomic->load (std::memory_order_relaxed) : 1.0f;
+
+    if (stepProb <= 0.0f)
+        return;
+
+    if (stepProb < 1.0f && probabilityRandom.nextFloat () >= stepProb)
+        return;
+
     // Note resolved at run-time from the atomic bank index; no 16-lane
     // propagation copy on the UI thread required.
     const int activeBank = activeNoteBank.load (std::memory_order_relaxed);
@@ -760,6 +839,91 @@ int PluginAudioProcessor::positiveMod (int value, int modulo)
     const int divisor = std::max (1, modulo);
     const int result  = value % divisor;
     return result < 0 ? result + divisor : result;
+}
+
+std::array<bool, PluginAudioProcessor::kAutomationStepCount>
+PluginAudioProcessor::computeEuclideanRhythm (int pulses, int steps)
+{
+    std::array<bool, kAutomationStepCount> pattern {};
+
+    const int numPulses = juce::jlimit (0, kAutomationStepCount, pulses);
+    const int numSteps  = juce::jlimit (1, kAutomationStepCount, steps);
+
+    if (numPulses == 0)
+        return pattern;
+
+    if (numPulses >= numSteps)
+    {
+        for (int i = 0; i < numSteps; ++i)
+            pattern[(size_t) i] = true;
+
+        return pattern;
+    }
+
+    // Björklund's algorithm, group-compaction form (port of the canonical
+    // reference implementation shared across Euclidean rhythm generators).
+    // Start with numSteps singleton groups: numPulses hit-groups followed by
+    // (numSteps - numPulses) rest-groups; repeatedly splice the trailing equal
+    // run into the leading equal run until every group is identical.
+    std::vector<std::vector<int>> groups;
+    groups.reserve ((size_t) numSteps);
+
+    for (int i = 0; i < numSteps; ++i)
+        groups.emplace_back (1, i < numPulses ? 1 : 0);
+
+    for (;;)
+    {
+        const int last = (int) groups.size () - 1;
+
+        if (last <= 0)
+            break;
+
+        // Leading run of groups identical to the first group.
+        int start = 0;
+
+        while (start < last && groups[(size_t) start] == groups[(size_t) 0])
+            ++start;
+
+        if (start == last)
+            break;
+
+        // Trailing run of groups identical to the last group.
+        int end = last;
+
+        while (end > 0 && groups[(size_t) end] == groups[(size_t) last])
+            --end;
+
+        if (end == 0)
+            break;
+
+        const int count = juce::jmin (start, last - end);
+
+        std::vector<std::vector<int>> next;
+        next.reserve (groups.size () - (size_t) count);
+
+        for (int i = 0; i < count; ++i)
+        {
+            auto merged = groups[(size_t) i];
+            merged.insert (merged.end (),
+                           groups[(size_t) (last - i)].begin (),
+                           groups[(size_t) (last - i)].end ());
+            next.push_back (std::move (merged));
+        }
+
+        for (int i = count; i <= last - count; ++i)
+            next.push_back (groups[(size_t) i]);
+
+        groups = std::move (next);
+    }
+
+    size_t out = 0;
+
+    for (const auto& group : groups)
+        for (const int hit : group)
+            if (out < pattern.size ())
+                pattern[out++] = (hit != 0);
+
+    return pattern;
 }
 
 // ---------------------------------------------------------------------------

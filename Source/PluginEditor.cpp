@@ -20,6 +20,37 @@ const char* const kSynthParamNames[PluginAudioEditor::kSynthParamCount] = {
 const char* const kSynthParamKeys[PluginAudioEditor::kSynthParamCount] = {
     "pitch", "attack", "decay", "sustain", "release", "lfo_rate", "lfo_depth", "noise_blend"
 };
+
+// On-hit velocity used by the Euclidean generator, matching the manual pad
+// baseline (100 on a 0..127 velocity scale).
+constexpr float kEuclidHitVelocity01 = 100.0f / 127.0f;
+
+// Commits a Björklund pattern into all 32 step-velocity states of a lane:
+// the sticky cache first (audio thread reads immediately), then each velocity
+// parameter via setValueNotifyingHost inside a single host edit gesture so the
+// whole 32-step rewrite records as one automation transaction.
+void applyEuclideanRhythm (PluginAudioProcessor& processor, int lane, int pulses, int steps)
+{
+    const auto pattern = PluginAudioProcessor::computeEuclideanRhythm (pulses, steps);
+
+    auto* gestureParam = processor.getLaneStepVelParameter (lane, 0);
+
+    if (gestureParam != nullptr)
+        gestureParam->beginChangeGesture ();
+
+    for (int step = 0; step < PluginAudioProcessor::kAutomationStepCount; ++step)
+    {
+        const float target = pattern[(size_t) step] ? kEuclidHitVelocity01 : 0.0f;
+
+        processor.setStepVelocity (lane, step, target);
+
+        if (auto* velParam = processor.getLaneStepVelParameter (lane, step))
+            velParam->setValueNotifyingHost (target);
+    }
+
+    if (gestureParam != nullptr)
+        gestureParam->endChangeGesture ();
+}
 }
 
 class PluginAudioEditor::MidiLearnButton final : public juce::Button
@@ -272,6 +303,35 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
     lfoWaveComboBox.setTooltip ("LFO waveform archetype for the active lane");
     addAndMakeVisible (lfoWaveComboBox);
 
+    euclidPulsesLabel.setFont (SequencerDesignSystem::sequenceNumberFont ());
+    euclidPulsesLabel.setColour (juce::Label::textColourId, SequencerDesignSystem::palette.text);
+    euclidPulsesLabel.setText ("EUC P", juce::dontSendNotification);
+    addAndMakeVisible (euclidPulsesLabel);
+
+    euclidStepsLabel.setFont (SequencerDesignSystem::sequenceNumberFont ());
+    euclidStepsLabel.setColour (juce::Label::textColourId, SequencerDesignSystem::palette.text);
+    euclidStepsLabel.setText ("EUC S", juce::dontSendNotification);
+    addAndMakeVisible (euclidStepsLabel);
+
+    euclidPulsesSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+    euclidPulsesSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 36, 12);
+    euclidPulsesSlider.setRange (0.0, (double) PluginAudioProcessor::kAutomationStepCount, 1.0);
+    euclidPulsesSlider.setValue (0.0);
+    euclidPulsesSlider.setTooltip ("Euclidean pulses for the active lane (0 = off)");
+    addAndMakeVisible (euclidPulsesSlider);
+
+    euclidStepsSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+    euclidStepsSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 36, 12);
+    euclidStepsSlider.setRange (1.0, (double) PluginAudioProcessor::kAutomationStepCount, 1.0);
+    euclidStepsSlider.setValue (16.0);
+    euclidStepsSlider.setTooltip ("Euclidean step count for the active lane");
+    addAndMakeVisible (euclidStepsSlider);
+
+    // Live drag-and-drop MIDI exporter: the button doubles as its own
+    // DragAndDropContainer so an OS-level file drag can leave the window.
+    midiDragComponent = std::make_unique<MidiDragExportComponent> (processor);
+    addAndMakeVisible (*midiDragComponent);
+
     rebuildSynthPanel (0);
 
     const char* const bankNames[] = { "A", "B", "C", "D" };
@@ -320,12 +380,45 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
 
     showLane (0);
 
+    // Seed the Euclidean macro snapshot from the persisted tree so a state
+    // restore never regenerates over manual pad edits, then register the
+    // message-thread listener that drives the generator.
+    for (int lane = 0; lane < PluginAudioProcessor::kNumLanes; ++lane)
+    {
+        const juce::String pulsesID = PluginAudioProcessor::laneEuclideanPulsesParameterID (lane);
+        const juce::String stepsID  = PluginAudioProcessor::laneEuclideanStepsParameterID (lane);
+
+        if (auto* pulsesParam = processor.getAPVTS ().getParameter (pulsesID))
+            lastEuclidPulses[(size_t) lane] = juce::roundToInt (
+                pulsesParam->getNormalisableRange ().convertFrom0to1 (pulsesParam->getValue ()));
+        else
+            lastEuclidPulses[(size_t) lane] = 0;
+
+        if (auto* stepsParam = processor.getAPVTS ().getParameter (stepsID))
+            lastEuclidSteps[(size_t) lane] = juce::roundToInt (
+                stepsParam->getNormalisableRange ().convertFrom0to1 (stepsParam->getValue ()));
+        else
+            lastEuclidSteps[(size_t) lane] = 16;
+
+        processor.getAPVTS ().addParameterListener (pulsesID, this);
+        processor.getAPVTS ().addParameterListener (stepsID, this);
+    }
+
     startTimerHz (30);
 }
 
 PluginAudioEditor::~PluginAudioEditor ()
 {
     stopTimer ();
+
+    for (int lane = 0; lane < PluginAudioProcessor::kNumLanes; ++lane)
+    {
+        processor.getAPVTS ().removeParameterListener (
+            PluginAudioProcessor::laneEuclideanPulsesParameterID (lane), this);
+        processor.getAPVTS ().removeParameterListener (
+            PluginAudioProcessor::laneEuclideanStepsParameterID (lane), this);
+    }
+
     setLookAndFeel (nullptr);
 }
 
@@ -371,7 +464,91 @@ void PluginAudioEditor::rebuildSynthPanel (int laneIndex)
         PluginAudioProcessor::laneSynthParameterID (synthPanelLane, "lfo_wave"),
         lfoWaveComboBox);
 
+    euclidPulsesAttachment.reset ();
+    euclidPulsesAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS (),
+        PluginAudioProcessor::laneEuclideanPulsesParameterID (synthPanelLane),
+        euclidPulsesSlider);
+
+    euclidStepsAttachment.reset ();
+    euclidStepsAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS (),
+        PluginAudioProcessor::laneEuclideanStepsParameterID (synthPanelLane),
+        euclidStepsSlider);
+
     repaint ();
+}
+
+void PluginAudioEditor::parameterChanged (const juce::String& parameterID, float newValue)
+{
+    // Only the Euclidean pulse/step macro pair is of interest here; everything
+    // else (velocity/synth state) is already owned by attachments + pads.
+    int  lane     = -1;
+    bool isPulses = false;
+
+    for (int l = 0; l < PluginAudioProcessor::kNumLanes; ++l)
+    {
+        if (parameterID == PluginAudioProcessor::laneEuclideanPulsesParameterID (l))
+        {
+            lane     = l;
+            isPulses = true;
+            break;
+        }
+
+        if (parameterID == PluginAudioProcessor::laneEuclideanStepsParameterID (l))
+        {
+            lane     = l;
+            isPulses = false;
+            break;
+        }
+    }
+
+    if (lane < 0)
+        return;
+
+    // APVTS delivers the normalized host value (0..1); rescale onto the
+    // generator's natural integer range so the macro reads like its slider.
+    const int minimum = isPulses ? 0 : 1;
+
+    int natural = minimum;
+
+    if (auto* macroParam = processor.getAPVTS ().getParameter (
+            isPulses ? PluginAudioProcessor::laneEuclideanPulsesParameterID (lane)
+                     : PluginAudioProcessor::laneEuclideanStepsParameterID (lane)))
+        natural = juce::jlimit (minimum, PluginAudioProcessor::kAutomationStepCount,
+                                juce::roundToInt (macroParam->getNormalisableRange ()
+                                                      .convertFrom0to1 (newValue)));
+
+    // Debounce: state restores, attachment re-syncs and host zero-notifications
+    // routinely replay values that never moved. Regenerating the grid on every
+    // such notification would stomp deliberate pad edits, so only a genuine
+    // macro change gets through.
+    auto& lastSeen = isPulses ? lastEuclidPulses[(size_t) lane]
+                              : lastEuclidSteps[(size_t) lane];
+
+    if (natural == lastSeen)
+        return;
+
+    lastSeen = natural;
+
+    // Pull the other macro's current value in so a single-macro move still
+    // observes the freshest pulse/step pair.
+    int other = isPulses ? 16 : 0;
+
+    if (auto* paramsParam = processor.getAPVTS ().getParameter (
+            isPulses ? PluginAudioProcessor::laneEuclideanStepsParameterID (lane)
+                     : PluginAudioProcessor::laneEuclideanPulsesParameterID (lane)))
+        other = juce::roundToInt (
+            paramsParam->getNormalisableRange ().convertFrom0to1 (paramsParam->getValue ()));
+
+    const int pulses = isPulses ? natural : other;
+    const int steps  = isPulses ? other : natural;
+
+    // Generator off (pulses == 0): leave the lane's manual grid untouched.
+    if (pulses < 1 || steps < 1)
+        return;
+
+    applyEuclideanRhythm (processor, lane, pulses, steps);
 }
 
 void PluginAudioEditor::updateTrackHeaders ()
@@ -452,6 +629,11 @@ void PluginAudioEditor::resized ()
 
     header.removeFromLeft (juce::roundToInt (headerGap));
 
+    // Far-right corner of the header: the live MIDI drag source. The exporter
+    // doubles as its own DragAndDropContainer so the file drag can leave the
+    // plugin window entirely (Finder / DAW clip slot).
+    midiDragComponent->setBounds (header.removeFromRight (86).reduced (2, 12));
+
     bankLabel.setBounds (header.removeFromTop (12));
 
     auto bankRow = header.removeFromTop (28);
@@ -476,9 +658,18 @@ void PluginAudioEditor::resized ()
 
     synthPanelTitle.setBounds (synthPanel.removeFromLeft (58).reduced (0, 34));
 
-    lfoWaveComboBox.setBounds (synthPanel.removeFromLeft (96).reduced (8, 22));
+    lfoWaveComboBox.setBounds (synthPanel.removeFromLeft (88).reduced (8, 22));
 
-    constexpr float synthGap  = 6.0f;
+    // Euclidean macro block: pulse/step rotary pair for the active lane.
+    auto euclidPulsesCell = synthPanel.removeFromLeft (54);
+    euclidPulsesLabel.setBounds (euclidPulsesCell.removeFromTop (16));
+    euclidPulsesSlider.setBounds (euclidPulsesCell.reduced (6, 2));
+
+    auto euclidStepsCell = synthPanel.removeFromLeft (54);
+    euclidStepsLabel.setBounds (euclidStepsCell.removeFromTop (16));
+    euclidStepsSlider.setBounds (euclidStepsCell.reduced (6, 2));
+
+    constexpr float synthGap  = 4.0f;
     const float    synthCell = (synthPanel.getWidth () - synthGap * (float) (kSynthParamCount - 1))
                                / (float) kSynthParamCount;
 

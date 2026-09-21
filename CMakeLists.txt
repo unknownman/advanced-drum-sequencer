@@ -36,10 +36,11 @@ juce_add_plugin (drumSeq
     NEEDS_MIDI_OUTPUT        TRUE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     # Declared per the production-freeze spec. JUCE 8's standalone wrapper
-    # derives the live automation surface from the APVTS at runtime (593 params:
-    # 512 lane-step velocities + swing + 80 internal-synth ADSR/pitch), so this
-    # value is host-facing explicitness metadata only and is not read internally.
-    JUCE_AUTOMATION_PARAMETER_COUNT 513
+    # derives the live automation surface from the APVTS at runtime (1233 params:
+    # 512 lane-step velocities + swing + 512 step-probabilities + 80 internal-
+    # synth ADSR/pitch + 64 Euclidean macros), so this value is host-facing
+    # explicitness metadata only and is not read internally.
+    JUCE_AUTOMATION_PARAMETER_COUNT 1233
 )
 
 target_link_libraries (drumSeq PRIVATE
@@ -65,6 +66,7 @@ target_sources (drumSeq PRIVATE
     Source/PluginEditor.cpp
     Source/DesignSystem/SequencerDesignSystem.cpp
     Source/UI/DynamicSequencerPad.cpp
+    Source/UI/MidiDragExportComponent.cpp
 )
 
 target_sources (drumSeq PRIVATE
@@ -72,6 +74,7 @@ target_sources (drumSeq PRIVATE
     Source/PluginEditor.h
     Source/DesignSystem/SequencerDesignSystem.h
     Source/UI/DynamicSequencerPad.h
+    Source/UI/MidiDragExportComponent.h
 )
 
 if (NOT CMAKE_BUILD_TYPE)
