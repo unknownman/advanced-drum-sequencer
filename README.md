@@ -113,7 +113,7 @@ drumSeq/
 
 | Tool                            | Version        | Notes                                  |
 | ------------------------------- | -------------- | -------------------------------------- |
-| macOS                           | 11.0+          | `CMAKE_OSX_DEPLOYMENT_TARGET=11.0`     |
+| macOS                           | 14.4+          | `CMAKE_OSX_DEPLOYMENT_TARGET=14.4`     |
 | Xcode Command Line Tools        | 15.x+          | `xcode-select --install`               |
 | CMake                           | 3.22+          | `brew install cmake`                   |
 | JUCE                            | 7.x / 8.x      | `git clone --depth 1 --branch 8.0.0 …` |

@@ -256,7 +256,7 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
         synthParamLabels[(size_t) i].setText (kSynthParamNames[(size_t) i], juce::dontSendNotification);
         addAndMakeVisible (synthParamLabels[(size_t) i]);
 
-        synthParamSliders[(size_t) i].setSliderStyle (juce::Slider::RotaryVerticalHorizontalDrag);
+        synthParamSliders[(size_t) i].setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
         synthParamSliders[(size_t) i].setTextBoxStyle (juce::Slider::TextBoxBelow, false, 40, 12);
         synthParamSliders[(size_t) i].setRange (sliderRanges[(size_t) i].start, sliderRanges[(size_t) i].end,
                                                 sliderRanges[(size_t) i].interval);
@@ -416,7 +416,7 @@ void PluginAudioEditor::resized ()
 {
     auto area = getLocalBounds ().reduced (10, 8);
 
-    const auto header = area.removeFromTop (56);
+    auto header = area.removeFromTop (56);
 
     constexpr float headerGap = 16.0f;
 
@@ -446,7 +446,7 @@ void PluginAudioEditor::resized ()
 
     // Compact parametric synth panel across the bottom (active lane). The five
     // sliders repaint/sync via the 30 Hz timer + SliderAttachments.
-    const auto synthPanel = area.removeFromBottom (92);
+    auto synthPanel = area.removeFromBottom (92);
 
     synthPanelTitle.setBounds (synthPanel.removeFromLeft (64).reduced (0, 34));
 
@@ -458,8 +458,8 @@ void PluginAudioEditor::resized ()
     {
         auto cell = synthPanel.removeFromLeft (juce::roundToInt (synthCell));
 
-        synthParamLabels[(size_t) i]->setBounds (cell.removeFromTop (16));
-        synthParamSliders[(size_t) i]->setBounds (cell.reduced (6, 2));
+        synthParamLabels[(size_t) i].setBounds (cell.removeFromTop (16));
+        synthParamSliders[(size_t) i].setBounds (cell.reduced (6, 2));
 
         if (i < kSynthParamCount - 1)
             synthPanel.removeFromLeft (juce::roundToInt (synthGap));

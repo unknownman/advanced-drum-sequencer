@@ -1,12 +1,15 @@
 cmake_minimum_required (VERSION 3.22)
 
-project (drumSeq VERSION 0.1.0 LANGUAGES CXX)
+project (drumSeq VERSION 0.1.0 LANGUAGES CXX C)
 
 set (CMAKE_CXX_STANDARD 20)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
 set (CMAKE_CXX_EXTENSIONS ON)
 set (CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
-set (CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
+# JUCE 8 + Xcode 16.x (macOS 15 SDK) require a >= 14.4 deployment target:
+# below that JUCE's window-snapshot fallback calls CGWindowListCreateImage,
+# which the macOS 15 SDK marks 'obsoleted' (unavailable) -> hard compile error.
+set (CMAKE_OSX_DEPLOYMENT_TARGET "14.4")
 
 if (NOT DEFINED JUCE_DIR)
     set (JUCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/juce" CACHE PATH "Path to the JUCE framework root")
@@ -37,6 +40,9 @@ juce_add_plugin (drumSeq
 target_link_libraries (drumSeq PRIVATE
     juce::juce_audio_processors
     juce::juce_audio_plugin_client
+    # Required by the Standalone wrapper (juce_audio_plugin_client_Standalone).
+    juce::juce_audio_utils
+    juce::juce_audio_devices
 )
 
 target_compile_definitions (drumSeq PRIVATE

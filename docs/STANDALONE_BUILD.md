@@ -9,7 +9,7 @@ parametric drum synth engine and the virtual transport clock.
 
 | Tool        | Requirement                                                        |
 | ----------- | ------------------------------------------------------------------ |
-| macOS       | 11.0 or newer (matches `CMAKE_OSX_DEPLOYMENT_TARGET`)              |
+| macOS       | 14.4 or newer (matches `CMAKE_OSX_DEPLOYMENT_TARGET`)              |
 | Xcode       | Installed with a Mac + iPhone runtimes (universal slices required) |
 | Xcode CLT   | `xcode-select --install`                                           |
 | JUCE        | Checkout at `<repo>/juce`, or point CMake at it via `-DJUCE_DIR=`  |
@@ -62,7 +62,9 @@ cmake --build build --config Release --target drumSeq_Standalone
 
 `juce_add_plugin (drumSeq ... FORMATS AU VST3 Standalone ...)` (CMakeLists.txt:22)
 emits the standalone wrapper as the `drumSeq_Standalone` target and the app
-bundle as `drumSeq.app`.
+bundle. With a multi-config Xcode generator the bundle lands at
+`build/drumSeq_artefacts/Release/Standalone/drumSeq.app` (JUCE >= 7 layout);
+`make_production_release.sh` auto-discovers this across generator layouts.
 
 Parallel builds are safe with an Xcode generator:
 
@@ -73,23 +75,23 @@ cmake --build build --config Release --target drumSeq_Standalone -j "$(sysctl -n
 ## 3. Verify both universal slices (optional but recommended)
 
 ```bash
-lipo -info build/Release/drumSeq.app/Contents/MacOS/drumSeq
-# Architectures in the fat file: build/Release/drumSeq.app/Contents/MacOS/drumSeq are: x86_64 arm64
+lipo -info build/drumSeq_artefacts/Release/Standalone/drumSeq.app/Contents/MacOS/drumSeq
+# Architectures in the fat file: build/drumSeq_artefacts/Release/Standalone/drumSeq.app/Contents/MacOS/drumSeq are: x86_64 arm64
 ```
 
 ## 4. Deep ad-hoc code-sign the app bundle
 
 ```bash
-codesign --force --deep --sign - build/Release/drumSeq.app
+codesign --force --deep --sign - build/drumSeq_artefacts/Release/Standalone/drumSeq.app
 
 # Confirm the signature:
-codesign -dv build/Release/drumSeq.app 2>&1 | grep -E "Identifier|Signature"
+codesign -dv build/drumSeq_artefacts/Release/Standalone/drumSeq.app 2>&1 | grep -E "Identifier|Signature"
 ```
 
 ## 5. Launch the standalone app
 
 ```bash
-open build/Release/drumSeq.app
+open build/drumSeq_artefacts/Release/Standalone/drumSeq.app
 ```
 
 Once launched, the standalone wrapper has **no host transport** — the

@@ -10,11 +10,12 @@ class SequencerDesignSystem : public juce::LookAndFeel_V4
 public:
     struct Palette
     {
-        const juce::Colour background   { 0xff121214 };
-        const juce::Colour padOff       { 0xff1e1e22 };
-        const juce::Colour padOn        { 0xff00ff66 };
-        const juce::Colour midiLearn    { 0xffff3366 };
-        const juce::Colour text         { 0xffa0a0a5 };
+        const juce::Colour background;
+        const juce::Colour padOff;
+        const juce::Colour padOn;
+        const juce::Colour midiLearn;
+        const juce::Colour text;
+        const juce::Colour accent;
 
         juce::Colour onPadTopColour (float velocity01) const noexcept
         {
@@ -37,7 +38,17 @@ public:
         }
     };
 
-    inline static const Palette palette {};
+    // Values initialized here (not as default member initializers) to avoid an
+    // AppleClang 17 bug: default member init + inline static aggregate caused
+    // "'X' needed within definition of enclosing class ... outside of member functions".
+    inline static const Palette palette {
+        juce::Colour { 0xff121214 },
+        juce::Colour { 0xff1e1e22 },
+        juce::Colour { 0xff00ff66 },
+        juce::Colour { 0xffff3366 },
+        juce::Colour { 0xffa0a0a5 },
+        juce::Colour { 0xff66ccff }
+    };
 
     static constexpr float kPadCornerRadius = 4.0f;
 

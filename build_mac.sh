@@ -5,7 +5,7 @@
 # Production automation harness for the AU/VST3/Standalone build documented in
 # README.md. Responsibilities:
 #   1. Dependency audit (tools, Xcode toolchain, JUCE checkout, path hygiene)
-#   2. Xcode project configuration enforcing "arm64;x86_64" + macOS 11.0
+#   2. Xcode project configuration enforcing "arm64;x86_64" + macOS 14.4
 #   3. Compile, then verifies BOTH universal slices with lipo (hard failure)
 #   4. Ad-hoc deep codesigning of the .component and .vst3 trees
 #   5. Install into ~/Library/Audio/Plug-Ins (Components + VST3)
@@ -28,7 +28,7 @@ cd -- "$SCRIPT_DIR"
 CONFIG="${CONFIG:-Release}"
 BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/build}"
 JUCE_DIR="${JUCE_DIR:-$SCRIPT_DIR/juce}"
-DEPLOYMENT_TARGET="11.0"
+DEPLOYMENT_TARGET="14.4"
 ARCHS="arm64;x86_64"
 
 PLUGIN_COMPONENTS_DIR="$HOME/Library/Audio/Plug-Ins/Components"

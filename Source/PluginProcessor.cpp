@@ -60,29 +60,31 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
     // Swing is declared 0..1 directly (straight = 0.0f, fully swung = 1.0f).
     layout.add (std::make_unique<juce::AudioParameterFloat> (
         "swing", "Swing",
-        juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f)
-            .withStringFromValueFunction ([] (float v)
-                                          {
-                                              return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 100.0f)) + "%";
-                                          }),
-        0.0f));
+        juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
+        0.0f,
+        juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [] (float v, int)
+            {
+                return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 100.0f)) + "%";
+            })));
 
     // Per-step velocity parameters are declared *normalized* 0..1 to prevent
     // DAW saturation; the 0..127 display string is supplied purely for humans.
+    const auto velocityAttributes = juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+        [] (float v, int)
+        {
+            return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 127.0f));
+        });
+
     for (int lane = 0; lane < kNumLanes; ++lane)
         for (int step = 0; step < kAutomationStepCount; ++step)
         {
-            const auto velocityRange = juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f / 127.0f)
-                                           .withStringFromValueFunction ([] (float v)
-                                                                         {
-                                                                             return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 127.0f));
-                                                                         });
-
             layout.add (std::make_unique<juce::AudioParameterFloat> (
                 laneStepVelParameterID (lane, step),
                 "Lane " + juce::String (lane + 1) + " Step " + juce::String (step + 1) + " Velocity",
-                velocityRange,
-                0.0f));
+                juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f / 127.0f),
+                0.0f,
+                velocityAttributes));
         }
 
     // Parametric internal-synth engine: 5 automatable configuration params per
@@ -91,56 +93,59 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
     // Ableton project saves round-trip the full synthesis setup.
     for (int lane = 0; lane < kNumLanes; ++lane)
     {
-        const auto pitchRange = juce::NormalisableRange<float> (-24.0f, 24.0f, 0.5f)
-                                    .withStringFromValueFunction ([] (float v)
-                                                                  {
-                                                                      return juce::String::formatted ("%+d st", juce::roundToInt (v));
-                                                                  });
-
         layout.add (std::make_unique<juce::AudioParameterFloat> (
             laneSynthParameterID (lane, "pitch"),
             "Lane " + juce::String (lane + 1) + " Synth Pitch",
-            pitchRange,
-            0.0f));
+            juce::NormalisableRange<float> (-24.0f, 24.0f, 0.5f),
+            0.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+                [] (float v, int)
+                {
+                    return juce::String::formatted ("%+d st", juce::roundToInt (v));
+                })));
 
-        const auto timeRange = [] (float hi)
+        const auto timeAttributes = [] ()
         {
-            return juce::NormalisableRange<float> (0.001f, hi, 0.0005f)
-                .withStringFromValueFunction ([] (float v)
-                                              {
-                                                  if (v >= 0.995f)
-                                                      return juce::String::formatted ("%.2f s", v);
-                                                  return juce::String::formatted ("%.1f ms", v * 1000.0f);
-                                              });
+            return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+                [] (float v, int)
+                {
+                    if (v >= 0.995f)
+                        return juce::String::formatted ("%.2f s", v);
+                    return juce::String::formatted ("%.1f ms", v * 1000.0f);
+                });
         };
 
         layout.add (std::make_unique<juce::AudioParameterFloat> (
             laneSynthParameterID (lane, "attack"),
             "Lane " + juce::String (lane + 1) + " Synth Attack",
-            timeRange (1.0f),
-            0.001f));
+            juce::NormalisableRange<float> (0.001f, 1.0f, 0.0005f),
+            0.001f,
+            timeAttributes ()));
 
         layout.add (std::make_unique<juce::AudioParameterFloat> (
             laneSynthParameterID (lane, "decay"),
             "Lane " + juce::String (lane + 1) + " Synth Decay",
-            timeRange (3.0f),
-            0.25f));
+            juce::NormalisableRange<float> (0.001f, 3.0f, 0.0005f),
+            0.25f,
+            timeAttributes ()));
 
         layout.add (std::make_unique<juce::AudioParameterFloat> (
             laneSynthParameterID (lane, "sustain"),
             "Lane " + juce::String (lane + 1) + " Synth Sustain",
-            juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f)
-                .withStringFromValueFunction ([] (float v)
-                                              {
-                                                  return juce::String (juce::roundToInt (v * 100.0f)) + "%";
-                                              }),
-            0.0f));
+            juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
+            0.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+                [] (float v, int)
+                {
+                    return juce::String (juce::roundToInt (v * 100.0f)) + "%";
+                })));
 
         layout.add (std::make_unique<juce::AudioParameterFloat> (
             laneSynthParameterID (lane, "release"),
             "Lane " + juce::String (lane + 1) + " Synth Release",
-            timeRange (3.0f),
-            0.1f));
+            juce::NormalisableRange<float> (0.001f, 3.0f, 0.0005f),
+            0.1f,
+            timeAttributes ()));
     }
 
     return layout;
@@ -813,7 +818,7 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
                                             int hwChannels)
 {
     const int numChannels = juce::jlimit (1, hwChannels, buffer.getNumChannels ());
-    const float* const* channels = buffer.getArrayOfWritePointers ();
+    float* const* channels = buffer.getArrayOfWritePointers ();
 
     const double invSampleRate = 1.0 / currentSampleRate;
 
