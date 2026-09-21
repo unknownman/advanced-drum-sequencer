@@ -19,7 +19,7 @@ public:
     static constexpr int kStepsAcross = 8;
     static constexpr int kStepsDown   = 4;
     static constexpr int kPadsPerLane = kStepsAcross * kStepsDown;
-    static constexpr int kSynthParamCount = 5;
+    static constexpr int kSynthParamCount = 8;
 
     explicit PluginAudioEditor (PluginAudioProcessor&);
     ~PluginAudioEditor () override;
@@ -63,6 +63,10 @@ private:
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>,
                kSynthParamCount> synthParamAttachments;
     int synthPanelLane = -1;
+
+    // LFO waveform selector (Sine / Triangle / Sawtooth) for the active lane.
+    juce::ComboBox lfoWaveComboBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> lfoWaveAttachment;
 
     int selectedLane     = 0;
     int lastPlayheadStep = -2;

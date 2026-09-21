@@ -48,6 +48,9 @@ target_link_libraries (drumSeq PRIVATE
     # Required by the Standalone wrapper (juce_audio_plugin_client_Standalone).
     juce::juce_audio_utils
     juce::juce_audio_devices
+    # FastMathApproximations (LFO sine archetype) is header-only but the module
+    # is not in the juce_audio_processors dependency chain, so link it directly.
+    juce::juce_dsp
 )
 
 target_compile_definitions (drumSeq PRIVATE

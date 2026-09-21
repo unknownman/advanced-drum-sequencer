@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <juce_dsp/juce_dsp.h>
+
 namespace drumseq
 {
 
@@ -146,6 +148,51 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
             juce::NormalisableRange<float> (0.001f, 3.0f, 0.0005f),
             0.1f,
             timeAttributes ()));
+
+        // LFO + noise texture surface: 4 extra automatable params per lane
+        // (64 new parameters for the 16-lane system). Declared directly on the
+        // APVTS layout tree, they inherit XML state serialization for free, so
+        // presets and Ableton project saves round-trip the full modulation setup.
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "lfo_rate"),
+            "Lane " + juce::String (lane + 1) + " Synth LFO Rate",
+            juce::NormalisableRange<float> (0.05f, 30.0f, 0.0005f),
+            1.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+                [] (float v, int)
+                {
+                    return juce::String::formatted ("%.2f Hz", v);
+                })));
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "lfo_depth"),
+            "Lane " + juce::String (lane + 1) + " Synth LFO Depth",
+            juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
+            0.0f,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+                [] (float v, int)
+                {
+                    return juce::String (juce::roundToInt (v * 100.0f)) + "%";
+                })));
+
+        layout.add (std::make_unique<juce::AudioParameterChoice> (
+            laneSynthParameterID (lane, "lfo_wave"),
+            "Lane " + juce::String (lane + 1) + " Synth LFO Wave",
+            juce::StringArray { "Sine", "Triangle", "Sawtooth" },
+            0));
+
+        const float defaultNoiseBlend = defaultNoiseBlendForModel (drumModelForLane (lane));
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "noise_blend"),
+            "Lane " + juce::String (lane + 1) + " Synth Noise Blend",
+            juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
+            defaultNoiseBlend,
+            juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+                [] (float v, int)
+                {
+                    return juce::String (juce::roundToInt (v * 100.0f)) + "%";
+                })));
     }
 
     return layout;
@@ -261,11 +308,15 @@ void PluginAudioProcessor::initialiseDrumSynth (double sampleRate)
     {
         auto& channel = synthParamChannels[(size_t) lane];
 
-        channel.pitch   = apvts.getRawParameterValue (laneSynthParameterID (lane, "pitch"));
-        channel.attack  = apvts.getRawParameterValue (laneSynthParameterID (lane, "attack"));
-        channel.decay   = apvts.getRawParameterValue (laneSynthParameterID (lane, "decay"));
-        channel.sustain = apvts.getRawParameterValue (laneSynthParameterID (lane, "sustain"));
-        channel.release = apvts.getRawParameterValue (laneSynthParameterID (lane, "release"));
+        channel.pitch      = apvts.getRawParameterValue (laneSynthParameterID (lane, "pitch"));
+        channel.attack     = apvts.getRawParameterValue (laneSynthParameterID (lane, "attack"));
+        channel.decay      = apvts.getRawParameterValue (laneSynthParameterID (lane, "decay"));
+        channel.sustain    = apvts.getRawParameterValue (laneSynthParameterID (lane, "sustain"));
+        channel.release    = apvts.getRawParameterValue (laneSynthParameterID (lane, "release"));
+        channel.lfoRate    = apvts.getRawParameterValue (laneSynthParameterID (lane, "lfo_rate"));
+        channel.lfoDepth   = apvts.getRawParameterValue (laneSynthParameterID (lane, "lfo_depth"));
+        channel.lfoWave    = apvts.getRawParameterValue (laneSynthParameterID (lane, "lfo_wave"));
+        channel.noiseBlend = apvts.getRawParameterValue (laneSynthParameterID (lane, "noise_blend"));
     }
 
     // Exponential pitch-sweep multiplier for the kick model.
@@ -288,17 +339,14 @@ void PluginAudioProcessor::initialiseDrumSynth (double sampleRate)
     // First-order high-pass coefficient for the hi-hat model.
     hiHatHPGain = 1.0 - std::exp (-kTwoPi * kSynth.hiHatHPFreq / sampleRate);
 
-    // Reset the fixed voice pool, the virtual playhead counter, and seed every
-    // pre-allocated juce::ADSR with the current sample rate.
+    // Reset the fixed voice pool to inactive defaults (envelope/LFO/noise state
+    // is re-prepared per hit against the validated sample rate).
     internalPpqPosition = 0.0;
     drumVoiceRoll       = 0;
     voiceSeedCounter    = 1;
 
     for (auto& voice : drumVoices)
-    {
         voice = DrumVoice {};
-        voice.adsr.setSampleRate (sampleRate);
-    }
 }
 
 void PluginAudioProcessor::releaseResources ()
@@ -736,6 +784,20 @@ PluginAudioProcessor::DrumModel PluginAudioProcessor::drumModelForLane (int lane
     }
 }
 
+float PluginAudioProcessor::defaultNoiseBlendForModel (DrumModel model) noexcept
+{
+    // Kick bodies are pure sine sweeps -> no white texture by default; the
+    // snare and hi-hat frames lift a mid-level gritty white layer on top.
+    switch (model)
+    {
+        case DrumModel::kick:  return 0.0f;
+        case DrumModel::snare: return 0.30f;
+        case DrumModel::hihat: return 0.45f;
+    }
+
+    return 0.0f;
+}
+
 std::uint32_t PluginAudioProcessor::nextXorshift (std::uint32_t& state)
 {
     state ^= state << 13;
@@ -781,20 +843,40 @@ void PluginAudioProcessor::triggerDrumVoice (int lane, float velocity01)
     voice.outputGain  = juce::jlimit (0.0f, 1.0f, velocity01);
     voice.pitchScale  = std::pow (2.0, pitchSemitones / 12.0);
 
-    voice.adsr.setSampleRate (currentSampleRate);
-    voice.adsrParams.attack  = attack;
-    voice.adsrParams.decay   = decay;
-    voice.adsrParams.sustain = sustain;
-    voice.adsrParams.release = release;
+    // Custom exponential envelope: attack snaps to 1.0, decay/release then
+    // fall along e^{-t/tau}. No juce::ADSR linear stages remain.
+    voice.env.prepare (attack, decay, sustain, release, currentSampleRate);
+
+    // Lock-free LFO capture. lfoPhaseInc is fixed per hit, so the render loop
+    // only ever accumulates + subtracts; the sine archetype uses the FastMath
+    // polynomial approximation (never a per-sample libm sin).
+    const float lfoRateHz = juce::jmax (0.05f,
+        channel.lfoRateRange.convertFrom0to1 (juce::jlimit (0.0f, 1.0f,
+            loadOr (channel.lfoRate, channel.lfoRateRange.convertTo0to1 (1.0f)))));
+    voice.lfoPhase     = 0.0;
+    voice.lfoPhaseInc  = (double) lfoRateHz / currentSampleRate;
+    voice.lfoDepth     = juce::jlimit (0.0f, 1.0f, loadOr (channel.lfoDepth, 0.0f));
+    voice.lfoWave      = juce::roundToInt (juce::jlimit (0.0f, 1.0f,
+                                              loadOr (channel.lfoWave, 0.0f)) * 2.0f);
+
+    // Noise texture: blend captures how much raw white is added AND how dark
+    // it is. Higher blend -> lower first-order low-pass cutoff (deeper, more
+    // percussive frame); blend 0 keeps the voice tonally pure.
+    voice.noiseBlend   = juce::jlimit (0.0f, 1.0f,
+        loadOr (channel.noiseBlend, defaultNoiseBlendForModel (voice.model)));
+    {
+        constexpr double kNoiseBrightHz = 14000.0;
+        constexpr double kNoiseDarkHz   = 400.0;
+        const double fc = kNoiseBrightHz - (kNoiseBrightHz - kNoiseDarkHz) * (double) voice.noiseBlend;
+        voice.noiseLPK  = 1.0 - std::exp (-kTwoPi * fc / currentSampleRate);
+        voice.noiseLPState = 0.0;
+    }
 
     // Percussive hits are staccato: after attack + decay the initial transient
     // is spent, so force the release stage (envelope tail) shortly afterwards.
     // The cap guarantees the fixed pool always reclaims the voice.
     voice.noteOffCountdown = (int) ((attack + decay) * currentSampleRate);
     voice.samplesLeft      = (int) ((kSynth.maxEnvelopeS + kVoiceTailSafetySeconds) * currentSampleRate);
-
-    voice.adsr.setParameters (voice.adsrParams);
-    voice.adsr.noteOn ();
 
     voice.noiseState = (voiceSeedCounter += 0x6D2B79F5u) | 1u;
 
@@ -824,7 +906,7 @@ void PluginAudioProcessor::noteOffDrumVoices ()
 {
     for (auto& voice : drumVoices)
         if (voice.active)
-            voice.adsr.noteOff ();
+            voice.env.noteOff ();
 }
 
 void PluginAudioProcessor::renderInternalSynth (juce::AudioBuffer<float>& buffer, int numSamples, int hwChannels)
@@ -882,12 +964,14 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
         if (voice.noteOffCountdown == 0 && ! voice.noteOffSent)
         {
             voice.noteOffSent = true;
-            voice.adsr.noteOff ();
+            voice.env.noteOff ();
         }
 
-        const double env = voice.adsr.getNextSample ();
+        // Exponential amplitude contour: amp decays along e^{-t/tau} during
+        // decay/release. A fully spent envelope kills the voice.
+        const double env = voice.env.getNextSample ();
 
-        if (env <= 0.0 && ! voice.adsr.isActive ())
+        if (voice.env.isAudible ())
         {
             voice.active = false;
             break;
@@ -901,6 +985,39 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
 
         --voice.samplesLeft;
 
+        // Lock-free LFO phase integrate: fixed per-hit increment, wrapped by a
+        // single subtract (lfoPhaseInc << 1 for all valid rates/rates).
+        voice.lfoPhase += voice.lfoPhaseInc;
+        if (voice.lfoPhase >= 1.0)
+            voice.lfoPhase -= 1.0;
+
+        // LFO archetype shape, sampled on the fly. The sine uses the FastMath
+        // polynomial approximation; triangle/saw are closed-form branches.
+        double lfoValue = 0.0;
+        switch (voice.lfoWave)
+        {
+            case 1:  lfoValue = 4.0 * std::abs (voice.lfoPhase - 0.5) - 1.0;
+                     break;
+            case 2:  lfoValue = 2.0 * voice.lfoPhase - 1.0;
+                     break;
+            default: lfoValue = (double) juce::dsp::FastMathApproximations::sin (
+                                    (float) (kTwoPi * voice.lfoPhase));
+                     break;
+        }
+
+        // ModulatedScale = basePitchScale x (1.0 + lfoValue x depth x 0.15).
+        const double lfoPitchFactor = 1.0 + lfoValue * (double) voice.lfoDepth * 0.15;
+
+        // Dedicated white-noise texture darkened by the first-order low-pass
+        // derived from noise_blend (skipped entirely at blend == 0).
+        double texturedNoise = 0.0;
+        if (voice.noiseBlend > 0.0f)
+        {
+            const double white = nextXorshift (voice.noiseState) * (1.0 / 4294967295.0) * 2.0 - 1.0;
+            voice.noiseLPState += voice.noiseLPK * (white - voice.noiseLPState);
+            texturedNoise = voice.noiseLPState;
+        }
+
         double output = 0.0;
 
         switch (voice.model)
@@ -908,13 +1025,14 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
             case DrumModel::kick:
             {
                 // Sine oscillator, exponential pitch sweep 150 -> 50 Hz, scaled
-                // live by the lane's Synth Pitch parameter.
+                // live by the lane's Synth Pitch parameter and LFO warp.
                 const double freq = (kSynth.kickBaseFreq + kSynth.kickPitchExc * voice.kickPitchExc)
-                                    * voice.pitchScale;
+                                    * (voice.pitchScale * lfoPitchFactor);
                 voice.kickPhase += kTwoPi * freq * invSampleRate;
                 voice.kickPitchExc *= kickPitchStep;
 
                 output = std::sin (voice.kickPhase) * env;
+                output += texturedNoise * env * (double) voice.noiseBlend * 0.35;
                 break;
             }
 
@@ -935,9 +1053,10 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
 
                 const double bandPassed = voice.bandY1;
                 const double tone = std::sin (voice.tonePhase);
-                voice.tonePhase += snareTonePhaseInc * voice.pitchScale;
+                voice.tonePhase += snareTonePhaseInc * voice.pitchScale * lfoPitchFactor;
 
                 output = bandPassed * (0.55 + 0.45 * env) + tone * (env * env);
+                output += texturedNoise * (double) voice.noiseBlend * env * 0.5;
                 break;
             }
 
@@ -949,6 +1068,7 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
                 const double hp = hiHatHPGain * ((noise - voice.hpLastX) + voice.hpLastY);
 
                 output = hp * env * (1.0 - kSynth.hiHatNoisePole);
+                output += texturedNoise * (double) voice.noiseBlend * env * 0.5;
 
                 voice.hpLastX = noise;
                 voice.hpLastY = hp;
@@ -963,7 +1083,7 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
             channels[c][s] += (float) output;   // accumulate: 16 voices share the bus
     }
 
-    if (voice.samplesLeft <= 0 || ! voice.adsr.isActive ())
+    if (voice.samplesLeft <= 0 || voice.env.isAudible ())
         voice.active = false;
 }
 

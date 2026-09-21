@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -38,23 +39,97 @@ public:
 
     static constexpr int kDrumVoiceCount = 16;
 
+    // High-precision Exponential ADSR: decay and release stages drop along a
+    // downward logarithmic contour (e^{-t/tau}) via constant per-sample
+    // multipliers, so no exp() is ever evaluated inside the render loop. The
+    // attack stage snaps the transient aggressively, then hands off to the
+    // exponential decay curve toward the sustain level.
+    struct ExponentialEnvelope
+    {
+        double amp        = 0.0;
+        double attackStep = 0.0;   // linear per-sample rise toward 1.0 (snapped onset)
+        double decayK     = 1.0;   // e^{-1/(tau_d * fs)} per-sample multiplier
+        double releaseK   = 1.0;   // e^{-1/(tau_r * fs)} per-sample multiplier
+        double sustain    = 0.0;   // decay-stage target level
+        bool   inAttack   = false;
+        bool   inRelease  = false;
+
+        void reset () noexcept
+        {
+            amp = 0.0; attackStep = 0.0;
+            decayK = 1.0; releaseK = 1.0; sustain = 0.0;
+            inAttack = inRelease = false;
+        }
+
+        void prepare (double attackSec, double decaySec, double releaseSec,
+                      double sustainLevel, double sampleRate) noexcept
+        {
+            const double sr = sampleRate > 0.0 ? sampleRate : 48000.0;
+            const double a  = juce::jmax (attackSec, 1.0e-4);
+            const double d  = juce::jmax (decaySec,  1.0e-4);
+            const double r  = juce::jmax (releaseSec, 1.0e-4);
+
+            amp       = 0.0;
+            sustain   = juce::jlimit (0.0, 1.0, sustainLevel);
+            attackStep = 1.0 / (a * sr);
+            decayK    = std::exp (-1.0 / (d * sr));
+            releaseK  = std::exp (-1.0 / (r * sr));
+            inAttack  = true;
+            inRelease = false;
+        }
+
+        void noteOff () noexcept { inRelease = true; }
+
+        double getNextSample () noexcept
+        {
+            if (inAttack)
+            {
+                amp += attackStep;
+                if (amp >= 1.0)
+                {
+                    amp = 1.0;
+                    inAttack = false;
+                }
+            }
+            else if (inRelease)
+            {
+                amp *= releaseK;
+            }
+            else
+            {
+                amp = sustain + (amp - sustain) * decayK;
+            }
+
+            return amp;
+        }
+
+        bool isAudible () const noexcept { return ! inAttack && amp <= 1.0e-4; }
+    };
+
     // Per-lane parametric synth parameters, surfaced as pre-cached atomic
     // pointers (apvts.getRawParameterValue) so the audio thread never performs
     // string lookups. Stored values are normalized 0..1; the range is kept in
     // the channel struct for instant convertFrom0to1 on the audio thread.
     struct SynthParamChannel
     {
-        std::atomic<float>* pitch   = nullptr;
-        std::atomic<float>* attack  = nullptr;
-        std::atomic<float>* decay   = nullptr;
-        std::atomic<float>* sustain = nullptr;
-        std::atomic<float>* release = nullptr;
+        std::atomic<float>* pitch      = nullptr;
+        std::atomic<float>* attack     = nullptr;
+        std::atomic<float>* decay      = nullptr;
+        std::atomic<float>* sustain    = nullptr;
+        std::atomic<float>* release    = nullptr;
+        std::atomic<float>* lfoRate    = nullptr;
+        std::atomic<float>* lfoDepth   = nullptr;
+        std::atomic<float>* lfoWave    = nullptr;
+        std::atomic<float>* noiseBlend = nullptr;
 
-        juce::NormalisableRange<float> pitchRange   { -24.0f, 24.0f, 0.5f };
-        juce::NormalisableRange<float> attackRange  { 0.001f, 1.0f,  0.0005f };
-        juce::NormalisableRange<float> decayRange   { 0.001f, 3.0f,  0.0005f };
-        juce::NormalisableRange<float> sustainRange { 0.0f,   1.0f,  0.001f };
-        juce::NormalisableRange<float> releaseRange { 0.001f, 3.0f,  0.0005f };
+        juce::NormalisableRange<float> pitchRange       { -24.0f, 24.0f, 0.5f };
+        juce::NormalisableRange<float> attackRange      { 0.001f, 1.0f,  0.0005f };
+        juce::NormalisableRange<float> decayRange       { 0.001f, 3.0f,  0.0005f };
+        juce::NormalisableRange<float> sustainRange     { 0.0f,   1.0f,  0.001f };
+        juce::NormalisableRange<float> releaseRange     { 0.001f, 3.0f,  0.0005f };
+        juce::NormalisableRange<float> lfoRateRange     { 0.05f,  30.0f, 0.0005f };
+        juce::NormalisableRange<float> lfoDepthRange    { 0.0f,   1.0f,  0.001f };
+        juce::NormalisableRange<float> noiseBlendRange  { 0.0f,   1.0f,  0.001f };
     };
 
     struct DrumVoice
@@ -67,11 +142,25 @@ public:
 
         float outputGain = 1.0f;      // captured MIDI velocity 0..1
 
-        // Fully polyphonic ADSR state, driven lock-free by per-lane atomics.
-        juce::ADSR adsr;
-        juce::ADSR::Parameters adsrParams { 0.001f, 0.25f, 0.0f, 0.1f };
+        // Fully polyphonic exponential envelope, driven lock-free by per-lane
+        // atomics. Decay/release follow e^{-t/tau}.
+        ExponentialEnvelope env;
 
         double pitchScale = 1.0;      // 2^(semitones / 12)
+
+        // LFO modulation state (captured at hit onset; advanced per-sample by
+        // lfoPhaseInc = lfo_rate / sampleRate, no allocations, no per-sample
+        // exp/trig beyond the FastMath sin approximation).
+        double lfoPhase     = 0.0;
+        double lfoPhaseInc  = 0.0;
+        float  lfoDepth     = 0.0f;   // 0..1 depth toward oscillator pitch
+        int    lfoWave      = 0;      // 0 sine, 1 triangle, 2 sawtooth
+
+        // Dedicated white-noise texture, darkened by a first-order low-pass
+        // whose cutoff is derived from the lane's noise_blend coefficient.
+        float  noiseBlend   = 0.0f;
+        double noiseLPK     = 0.0;
+        double noiseLPState = 0.0;
 
         // Kick: sine-phase oscillator with exponential pitch sweep.
         double kickPhase    = 0.0;
@@ -171,6 +260,7 @@ private:
     void triggerDrumVoice (int lane, float velocity01);
     void noteOffDrumVoices ();
     static DrumModel drumModelForLane (int lane);
+    static float defaultNoiseBlendForModel (DrumModel model) noexcept;
     static std::uint32_t nextXorshift (std::uint32_t& state);
 
     static int positiveMod (int value, int modulo);

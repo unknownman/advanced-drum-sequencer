@@ -14,11 +14,11 @@ const char* const kTrackNames[PluginAudioProcessor::kNumLanes] = {
 };
 
 const char* const kSynthParamNames[PluginAudioEditor::kSynthParamCount] = {
-    "PITCH", "ATK", "DECAY", "SUSTAIN", "RELEASE"
+    "PITCH", "ATK", "DECAY", "SUSTAIN", "RELEASE", "LFO RT", "LFO DP", "NOISE"
 };
 
 const char* const kSynthParamKeys[PluginAudioEditor::kSynthParamCount] = {
-    "pitch", "attack", "decay", "sustain", "release"
+    "pitch", "attack", "decay", "sustain", "release", "lfo_rate", "lfo_depth", "noise_blend"
 };
 }
 
@@ -245,7 +245,10 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
         { 0.001f, 1.0f, 0.0005f },    // attack (s)
         { 0.001f, 3.0f, 0.0005f },    // decay (s)
         { 0.0f, 1.0f, 0.001f },       // sustain (0..1)
-        { 0.001f, 3.0f, 0.0005f }     // release (s)
+        { 0.001f, 3.0f, 0.0005f },    // release (s)
+        { 0.05f, 30.0f, 0.0005f },    // lfo rate (Hz)
+        { 0.0f, 1.0f, 0.001f },       // lfo depth (0..1)
+        { 0.0f, 1.0f, 0.001f }        // noise blend (0..1)
     };
 
     for (int i = 0; i < kSynthParamCount; ++i)
@@ -264,6 +267,10 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
                                                   + " for the active lane");
         addAndMakeVisible (synthParamSliders[(size_t) i]);
     }
+
+    lfoWaveComboBox.addItemList ({ "SINE", "TRI", "SAW" }, 1);
+    lfoWaveComboBox.setTooltip ("LFO waveform archetype for the active lane");
+    addAndMakeVisible (lfoWaveComboBox);
 
     rebuildSynthPanel (0);
 
@@ -357,6 +364,12 @@ void PluginAudioEditor::rebuildSynthPanel (int laneIndex)
                 PluginAudioProcessor::laneSynthParameterID (synthPanelLane, kSynthParamKeys[(size_t) i]),
                 synthParamSliders[(size_t) i]);
     }
+
+    lfoWaveAttachment.reset ();
+    lfoWaveAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
+        processor.getAPVTS (),
+        PluginAudioProcessor::laneSynthParameterID (synthPanelLane, "lfo_wave"),
+        lfoWaveComboBox);
 
     repaint ();
 }
@@ -456,13 +469,16 @@ void PluginAudioEditor::resized ()
             bankRow.getHeight ());
     }
 
-    // Compact parametric synth panel across the bottom (active lane). The five
-    // sliders repaint/sync via the 30 Hz timer + SliderAttachments.
+    // Compact parametric synth panel across the bottom (active lane). The eight
+    // sliders (Pitch + ADSR + LFO Rate/Depth + Noise Blend) repaint/sync via the
+    // 30 Hz timer + SliderAttachments; the LFO wave combo sits next to the title.
     auto synthPanel = area.removeFromBottom (92);
 
-    synthPanelTitle.setBounds (synthPanel.removeFromLeft (64).reduced (0, 34));
+    synthPanelTitle.setBounds (synthPanel.removeFromLeft (58).reduced (0, 34));
 
-    constexpr float synthGap  = 8.0f;
+    lfoWaveComboBox.setBounds (synthPanel.removeFromLeft (96).reduced (8, 22));
+
+    constexpr float synthGap  = 6.0f;
     const float    synthCell = (synthPanel.getWidth () - synthGap * (float) (kSynthParamCount - 1))
                                / (float) kSynthParamCount;
 
