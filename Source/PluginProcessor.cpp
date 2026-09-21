@@ -25,17 +25,33 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    layout.add (std::make_unique<juce::AudioParameterFloat> ("swing", "Swing",
-                                                             juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
-                                                             0.5f));
+    // Swing is declared 0..1 directly (straight = 0.0f, fully swung = 1.0f).
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        "swing", "Swing",
+        juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f)
+            .withStringFromValueFunction ([] (float v)
+                                          {
+                                              return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 100.0f)) + "%";
+                                          }),
+        0.0f));
 
+    // Per-step velocity parameters are declared *normalized* 0..1 to prevent
+    // DAW saturation; the 0..127 display string is supplied purely for humans.
     for (int lane = 0; lane < kNumLanes; ++lane)
         for (int step = 0; step < kAutomationStepCount; ++step)
+        {
+            const auto velocityRange = juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f / 127.0f)
+                                           .withStringFromValueFunction ([] (float v)
+                                                                         {
+                                                                             return juce::String (juce::roundToInt (juce::jlimit (0.0f, 1.0f, v) * 127.0f));
+                                                                         });
+
             layout.add (std::make_unique<juce::AudioParameterFloat> (
                 laneStepVelParameterID (lane, step),
                 "Lane " + juce::String (lane + 1) + " Step " + juce::String (step + 1) + " Velocity",
-                juce::NormalisableRange<float> (0.0f, 127.0f, 0.01f),
+                velocityRange,
                 0.0f));
+        }
 
     return layout;
 }
@@ -63,12 +79,13 @@ void PluginAudioProcessor::initialiseCaches ()
     timelinePrimed     = false;
     wasPlayingLast     = false;
     lastSixteenthFired = 0;
+    noteOffCount       = 0;
 }
 
 void PluginAudioProcessor::resetPatternData ()
 {
     laneInLearnMode.store (-1, std::memory_order_relaxed);
-    swingParamCache.store (0.5f, std::memory_order_relaxed);
+    swingParamCache.store (0.0f, std::memory_order_relaxed);
     fallbackBpmCache.store (120.0, std::memory_order_relaxed);
 
     activeNoteBank.store (0, std::memory_order_relaxed);
@@ -76,23 +93,33 @@ void PluginAudioProcessor::resetPatternData ()
 
     for (int bank = 0; bank < kNumNoteBanks; ++bank)
         for (int lane = 0; lane < kNumLanes; ++lane)
-            noteBankCaches[(size_t) bank][(size_t) lane].store (36 + lane + bank * 12, std::memory_order_relaxed);
+            noteBankCaches[(size_t) bank][(size_t) lane].store (36 + lane + bank * kNoteBankSpacing,
+                                                                std::memory_order_relaxed);
 
     for (int lane = 0; lane < kNumLanes; ++lane)
     {
         loopLengthCaches[(size_t) lane].store (16, std::memory_order_relaxed);
-        targetNoteCaches[(size_t) lane].store (36 + lane, std::memory_order_relaxed);
         velocityScaleCaches[(size_t) lane].store (1.0f, std::memory_order_relaxed);
         currentStepCaches[(size_t) lane].store (-1, std::memory_order_relaxed);
 
         for (int step = 0; step < kMaxStepsPerLane; ++step)
             stepVelocityCaches[(size_t) lane][(size_t) step].store (0.0f, std::memory_order_relaxed);
     }
+
+    for (auto& slot : noteOffQueue)
+        slot.active = false;
+
+    noteOffCount = 0;
 }
 
-void PluginAudioProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
+void PluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    currentSampleRate = sampleRate;
+    currentSampleRate    = sampleRate;
+    noteOffQueue.fill ({});
+
+    // Pre-roll the scratch surface and (indirectly) the host's MIDI buffer so
+    // dense note queues never allocate on the audio thread.
+    scratchBuffer.ensureSize (8192u);
 
     if (auto* swing = apvts.getParameter ("swing"))
         setSwing (swing->getValue ());
@@ -115,18 +142,18 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     const int numSamples = buffer.getNumSamples ();
 
     bool isPlaying = false;
-    double ppqStart  = 0.0;
-    double bpm       = fallbackBpmCache.load (std::memory_order_relaxed);
-    double sampleRate = currentSampleRate;
+    double ppqStart = 0.0;
+    double bpm      = fallbackBpmCache.load (std::memory_order_relaxed);
+    double sampleRate = getSampleRate ();
+
+    if (sampleRate <= 0.0)
+        sampleRate = currentSampleRate;
 
     if (auto* playhead = getPlayHead ())
     {
         if (const auto position = playhead->getPosition ())
         {
             isPlaying = position->getIsPlaying ();
-
-            if (const auto s = position->getSampleRate ())
-                sampleRate = *s;
 
             if (const auto b = position->getBpm ())
                 bpm = *b;
@@ -140,12 +167,23 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     fallbackBpmCache.store (bpm, std::memory_order_relaxed);
 
     if (isPlaying)
+    {
+        processPendingNoteOffs (midiMessages, numSamples);
         scheduleLanes (midiMessages, numSamples, ppqStart, bpm, sampleRate);
+    }
     else
+    {
         stopAndFlush (midiMessages);
+    }
 
     wasPlayingLast = isPlaying;
 }
+
+// ---------------------------------------------------------------------------
+// Raw-byte MIDI parsing. metadata.getMessage() is deliberately avoided on the
+// audio thread: the status/note/CC bytes are read straight off the event
+// pointer so large SysEx blocks and handshake replies never get materialized.
+// ---------------------------------------------------------------------------
 
 void PluginAudioProcessor::maybeProcessMIDILearn (juce::MidiBuffer& midiMessages)
 {
@@ -156,17 +194,40 @@ void PluginAudioProcessor::maybeProcessMIDILearn (juce::MidiBuffer& midiMessages
 
     for (const auto& metadata : midiMessages)
     {
-        const auto& message = metadata.getMessage ();
-
-        if (! message.isNoteOn () || message.getVelocity () == 0)
+        if (metadata.numBytes < 3)
             continue;
 
-        targetNoteCaches[(size_t) laneToLearn].store (message.getNoteNumber (), std::memory_order_relaxed);
+        const auto* data = metadata.data;
+
+        if ((data[0] & 0xF0) != 0x90)            // note-on family
+            continue;
+
+        if ((data[0] & 0x0F) != (kBasicChannel - 1))   // MIDI channel 1 only
+            continue;
+
+        const int velocity = data[2];
+
+        if (velocity == 0)
+            continue;
+
+        const int capturedNote = data[1];
+
+        // Assign into the active note bank first: even if a concurrent UI
+        // action steals learn mode, the hardware hit remains programmed.
         noteBankCaches[(size_t) activeNoteBank.load (std::memory_order_relaxed)][(size_t) laneToLearn].store (
-            message.getNoteNumber (), std::memory_order_relaxed);
-        laneInLearnMode.store (-1, std::memory_order_relaxed);
-        midiMessages.clear ();
-        return;
+            capturedNote, std::memory_order_relaxed);
+
+        // compare_exchange_strong: only disarm if we still own learn mode; a
+        // cross-thread re-arm mid-capture must not be clobbered to -1.
+        int expected = laneToLearn;
+
+        if (laneInLearnMode.compare_exchange_strong (expected, -1,
+                                                     std::memory_order_relaxed,
+                                                     std::memory_order_relaxed))
+        {
+            midiMessages.clear ();
+            return;
+        }
     }
 }
 
@@ -176,13 +237,19 @@ void PluginAudioProcessor::processHardwareController (juce::MidiBuffer& midiMess
 
     for (const auto& metadata : midiMessages)
     {
-        const auto& message = metadata.getMessage ();
-
-        if (! message.isController ())
+        if (metadata.numBytes < 3)
             continue;
 
-        const int cc    = message.getControllerNumber ();
-        const int value = message.getControllerValue ();
+        const auto* data = metadata.data;
+
+        if ((data[0] & 0xF0) != 0xB0)                  // control change family
+            continue;
+
+        if ((data[0] & 0x0F) != (kBasicChannel - 1))   // MIDI channel 1 only
+            continue;
+
+        const int cc    = data[1];
+        const int value = data[2];
 
         if (cc >= 12 && cc <= 19)
         {
@@ -206,6 +273,76 @@ void PluginAudioProcessor::processHardwareController (juce::MidiBuffer& midiMess
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent note-off queue. Note-offs are never clamped to the current block:
+// a lookahead entry carries its absolute sample delta and is decremented every
+// block until the owning future block arrives.
+// ---------------------------------------------------------------------------
+
+void PluginAudioProcessor::processPendingNoteOffs (juce::MidiBuffer& midiMessages, int numSamples)
+{
+    if (noteOffCount == 0)
+        return;
+
+    const std::int64_t blockLength = (std::int64_t) juce::jmax (0, numSamples);
+
+    int out = 0;
+
+    for (int i = 0; i < noteOffCount; ++i)
+    {
+        auto& slot = noteOffQueue[(size_t) i];
+
+        if (slot.remainingSamples >= blockLength)
+        {
+            slot.remainingSamples -= blockLength;
+
+            if (out != i)
+                noteOffQueue[(size_t) out] = slot;
+
+            ++out;
+        }
+        else
+        {
+            const int samplePos = juce::jlimit (0, numSamples, (int) slot.remainingSamples);
+
+            midiMessages.addEvent (juce::MidiMessage::noteOff (kBasicChannel, slot.note, juce::uint8 (0)),
+                                   samplePos);
+        }
+    }
+
+    noteOffCount = out;
+
+    for (int i = out; i < kNoteOffQueueCapacity; ++i)
+        noteOffQueue[(size_t) i].active = false;
+}
+
+void PluginAudioProcessor::queueNoteOff (juce::MidiBuffer& midiMessages, int numSamples,
+                                        int note, std::int64_t absoluteSample)
+{
+    if (noteOffCount < kNoteOffQueueCapacity)
+    {
+        noteOffQueue[(size_t) noteOffCount] = { absoluteSample, note, true };
+        ++noteOffCount;
+        return;
+    }
+
+    // Pool exhausted (512 simultaneous notes is pathological): flush the oldest
+    // entry immediately instead of ever silently dropping a note-off.
+    auto& oldest = noteOffQueue[(size_t) 0];
+    midiMessages.addEvent (juce::MidiMessage::noteOff (kBasicChannel, oldest.note, juce::uint8 (0)),
+                           juce::jlimit (0, juce::jmax (0, numSamples - 1), (int) oldest.remainingSamples));
+
+    for (int i = 1; i < noteOffCount; ++i)
+        noteOffQueue[(size_t) (i - 1)] = noteOffQueue[(size_t) i];
+
+    --noteOffCount;
+    queueNoteOff (midiMessages, numSamples, note, absoluteSample);
+}
+
+// ---------------------------------------------------------------------------
+// Stateless absolute-sample window scheduler.
+// ---------------------------------------------------------------------------
+
 void PluginAudioProcessor::scheduleLanes (juce::MidiBuffer& midiMessages, int numSamples,
                                           double ppqStart, double bpm, double sampleRate)
 {
@@ -214,7 +351,9 @@ void PluginAudioProcessor::scheduleLanes (juce::MidiBuffer& midiMessages, int nu
 
     const double samplesPerStep = (60.0 * sampleRate * 0.25) / bpm;
     const double blockSpan      = (double) numSamples / samplesPerStep;
-    const double fracSixteenth  = ppqStart / 0.25;
+
+    // Absolute 16th position at the head of this block.
+    const double startStep = ppqStart * 4.0;
 
     if (! timelinePrimed)
     {
@@ -223,16 +362,19 @@ void PluginAudioProcessor::scheduleLanes (juce::MidiBuffer& midiMessages, int nu
         for (int lane = 0; lane < kNumLanes; ++lane)
             lastSteps[lane] = -1;
 
-        lastSixteenthFired = (int) std::floor (fracSixteenth);
+        lastSixteenthFired = (int) std::floor (startStep) - 1;
     }
 
-    const bool onExactBoundary = (fracSixteenth == std::floor (fracSixteenth));
-    const int startBoundary    = onExactBoundary ? (int) std::floor (fracSixteenth)
-                                                 : (int) std::ceil (fracSixteenth);
-    const int endBoundaryExclusive = (int) std::ceil (fracSixteenth + blockSpan);
+    // Window [start, end) of absolute 16th boundaries inside this block.
+    // ceil-based math (with a tiny epsilon) removes the float equality check;
+    // exact boundaries are included exactly once.
+    constexpr double kE  = 1e-9;
+    const int startBoundary = (int) std::ceil (startStep - kE);
+    const int endBoundaryExclusive = (int) std::ceil (startStep + blockSpan - kE);
 
-    if (startBoundary < lastSixteenthFired
-        || startBoundary - lastSixteenthFired > kMaxStepsPerLane * 2)
+    if (startBoundary - lastSixteenthFired > 1
+        && (startBoundary < lastSixteenthFired
+            || startBoundary - lastSixteenthFired > kMaxStepsPerLane * 2))
     {
         for (int lane = 0; lane < kNumLanes; ++lane)
             lastSteps[lane] = -1;
@@ -240,28 +382,30 @@ void PluginAudioProcessor::scheduleLanes (juce::MidiBuffer& midiMessages, int nu
         lastSixteenthFired = startBoundary - 1;
     }
 
-    for (int sixteenth = startBoundary; sixteenth < endBoundaryExclusive; ++sixteenth)
+    for (int absolute16 = startBoundary; absolute16 < endBoundaryExclusive; ++absolute16)
     {
-        const int baseSample = (int) std::floor ((sixteenth - fracSixteenth) * samplesPerStep + 0.5);
+        const int baseSample = (int) std::floor ((absolute16 - startStep) * samplesPerStep + 0.5);
 
         for (int lane = 0; lane < kNumLanes; ++lane)
-            renderLaneHit (midiMessages, lane, sixteenth, baseSample, samplesPerStep, numSamples);
+            renderLaneHit (midiMessages, lane, absolute16, baseSample, samplesPerStep, numSamples);
 
-        lastSixteenthFired = sixteenth;
+        lastSixteenthFired = absolute16;
     }
 }
 
 void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int lane,
-                                          int globalSixteenth, int baseSample,
+                                          int absoluteSixteenth, int baseSample,
                                           double samplesPerStep, int numSamples)
 {
-    const int loopLength = std::max (1, loopLengthCaches[(size_t) lane].load (std::memory_order_relaxed));
-    const int laneStep   = positiveMod (globalSixteenth, loopLength);
-
-    if (laneStep == lastSteps[lane])
+    // Deduplicate per *absolute* 16th, not per loop step: a live loop-length
+    // edit or a Loop Length of 1 re-fires on every boundary without skipping.
+    if (absoluteSixteenth == lastSteps[lane])
         return;
 
-    lastSteps[lane] = laneStep;
+    lastSteps[lane] = absoluteSixteenth;
+
+    const int loopLength = std::max (1, loopLengthCaches[(size_t) lane].load (std::memory_order_relaxed));
+    const int laneStep   = positiveMod (absoluteSixteenth, loopLength);
 
     currentStepCaches[(size_t) lane].store (laneStep, std::memory_order_relaxed);
 
@@ -270,29 +414,43 @@ void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int la
     if (velocity01 <= 0.0f)
         return;
 
-    const int midiNote = targetNoteCaches[(size_t) lane].load (std::memory_order_relaxed);
+    // Note resolved at run-time from the atomic bank index; no 16-lane
+    // propagation copy on the UI thread required.
+    const int activeBank = activeNoteBank.load (std::memory_order_relaxed);
+    const int midiNote   = noteBankCaches[(size_t) activeBank][(size_t) lane].load (std::memory_order_relaxed);
 
     if (midiNote < 0 || midiNote > 127)
         return;
 
     const float swing = juce::jlimit (0.0f, 1.0f, swingParamCache.load (std::memory_order_relaxed));
 
-    const int swingSamples = (laneStep % 2) == 0
+    // Global parity swing: shuffle locks to the absolute 16th grid (not the
+    // lane's modulo), so odd loop lengths keep a steady off-beat groove.
+    // swing == 0.0f yields a perfectly straight grid.
+    const int swingSamples = positiveMod (absoluteSixteenth, 2) == 0
                                  ? 0
                                  : (int) std::lround (samplesPerStep * (double) swing * 0.5);
 
-    const int samplePos     = juce::jlimit (0, numSamples, baseSample + swingSamples);
-    const float scale       = juce::jlimit (0.0f, 1.0f,
-                                            velocityScaleCaches[(size_t) lane].load (std::memory_order_relaxed));
-    const int velocityMidi  = juce::jlimit (1, 127, (int) std::lround (velocity01 * scale * 127.0f));
+    const int samplePos    = juce::jlimit (0, numSamples, baseSample + swingSamples);
+    const float scale      = juce::jlimit (0.0f, 1.0f,
+                                           velocityScaleCaches[(size_t) lane].load (std::memory_order_relaxed));
+    const int velocityMidi = juce::jlimit (1, 127, (int) std::lround (velocity01 * scale * 127.0f));
 
     midiMessages.addEvent (juce::MidiMessage::noteOn (kBasicChannel, midiNote, (juce::uint8) velocityMidi),
                            samplePos);
 
-    const int noteOffSamples = (int) std::lround (currentSampleRate * 0.08);
+    const std::int64_t noteOffSamples = (std::int64_t) std::lround (currentSampleRate * 0.08);
+    const std::int64_t noteOffSlot    = (std::int64_t) samplePos + noteOffSamples;
 
-    midiMessages.addEvent (juce::MidiMessage::noteOff (kBasicChannel, midiNote, juce::uint8 (0)),
-                           juce::jlimit (0, numSamples, samplePos + noteOffSamples));
+    if (noteOffSlot < numSamples)
+    {
+        midiMessages.addEvent (juce::MidiMessage::noteOff (kBasicChannel, midiNote, juce::uint8 (0)),
+                               (int) noteOffSlot);
+    }
+    else
+    {
+        queueNoteOff (midiMessages, numSamples, midiNote, noteOffSlot);
+    }
 }
 
 void PluginAudioProcessor::stopAndFlush (juce::MidiBuffer& midiMessages)
@@ -304,6 +462,11 @@ void PluginAudioProcessor::stopAndFlush (juce::MidiBuffer& midiMessages)
 
         for (int lane = 0; lane < kNumLanes; ++lane)
             currentStepCaches[(size_t) lane].store (-1, std::memory_order_relaxed);
+
+        for (auto& slot : noteOffQueue)
+            slot.active = false;
+
+        noteOffCount = 0;
     }
 
     timelinePrimed = false;
@@ -358,10 +521,7 @@ int PluginAudioProcessor::getLoopLength (int lane) const
 
 void PluginAudioProcessor::setTargetNote (int lane, int midiNote)
 {
-    if (lane < 0 || lane >= kNumLanes)
-        return;
-
-    targetNoteCaches[(size_t) lane].store (juce::jlimit (0, 127, midiNote), std::memory_order_relaxed);
+    setBankNote (activeNoteBank.load (std::memory_order_relaxed), lane, midiNote);
 }
 
 int PluginAudioProcessor::getTargetNote (int lane) const
@@ -369,7 +529,9 @@ int PluginAudioProcessor::getTargetNote (int lane) const
     if (lane < 0 || lane >= kNumLanes)
         return 0;
 
-    return targetNoteCaches[(size_t) lane].load (std::memory_order_relaxed);
+    const int bank = activeNoteBank.load (std::memory_order_relaxed);
+
+    return noteBankCaches[(size_t) bank][(size_t) lane].load (std::memory_order_relaxed);
 }
 
 void PluginAudioProcessor::setSwing (float value)
@@ -400,14 +562,9 @@ float PluginAudioProcessor::getVelocityScale (int lane) const
 
 void PluginAudioProcessor::setActiveNoteBank (int bank)
 {
-    const int clampedBank = juce::jlimit (0, kNumNoteBanks - 1, bank);
-
-    activeNoteBank.store (clampedBank, std::memory_order_relaxed);
-
-    for (int lane = 0; lane < kNumLanes; ++lane)
-        targetNoteCaches[(size_t) lane].store (
-            noteBankCaches[(size_t) clampedBank][(size_t) lane].load (std::memory_order_relaxed),
-            std::memory_order_relaxed);
+    // Single atomic store; the real-time thread resolves the note at render
+    // time from noteBankCaches[activeBank][lane]. No 16-lane loop copy.
+    activeNoteBank.store (juce::jlimit (0, kNumNoteBanks - 1, bank), std::memory_order_relaxed);
 }
 
 int PluginAudioProcessor::getActiveNoteBank () const noexcept
@@ -424,9 +581,6 @@ void PluginAudioProcessor::setBankNote (int bank, int lane, int midiNote)
     const int note        = juce::jlimit (0, 127, midiNote);
 
     noteBankCaches[(size_t) clampedBank][(size_t) lane].store (note, std::memory_order_relaxed);
-
-    if (clampedBank == activeNoteBank.load (std::memory_order_relaxed))
-        targetNoteCaches[(size_t) lane].store (note, std::memory_order_relaxed);
 }
 
 int PluginAudioProcessor::getBankNote (int bank, int lane) const
@@ -461,6 +615,33 @@ void PluginAudioProcessor::disarmMIDILearn ()
 int PluginAudioProcessor::getLaneInLearnMode () const noexcept
 {
     return laneInLearnMode.load (std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Program abstraction (single default program).
+// ---------------------------------------------------------------------------
+
+int PluginAudioProcessor::getNumPrograms ()
+{
+    return 1;
+}
+
+int PluginAudioProcessor::getCurrentProgram ()
+{
+    return 0;
+}
+
+void PluginAudioProcessor::setCurrentProgram (int /*index*/)
+{
+}
+
+const juce::String PluginAudioProcessor::getProgramName (int /*index*/)
+{
+    return juce::String (JucePlugin_Name) + " Default";
+}
+
+void PluginAudioProcessor::changeProgramName (int /*index*/, const juce::String& /*newName*/)
+{
 }
 
 juce::AudioProcessorEditor* PluginAudioProcessor::createEditor ()

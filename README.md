@@ -195,26 +195,26 @@ remote script tables (`Source/Scripts/MPD32SequencerMap.py`).
 
 Pads send MIDI notes on **channel 1**. Each lane has four software note banks
 `A/B/C/D` selectable from the editor header; the engine formula is
-`note = 36 + lane + bank·12`.
+`note = 36 + lane + bank·16` (banks align to Ableton 16-pad Drum Racks).
 
 | Pad | Lane  | Name        | Bank A | Bank B | Bank C | Bank D |
 | --- | ----- | ----------- | ------ | ------ | ------ | ------ |
-| 1   | 0     | Kick        | 36     | 48     | 60     | 72     |
-| 2   | 1     | Snare       | 37     | 49     | 61     | 73     |
-| 3   | 2     | Hat Closed  | 38     | 50     | 62     | 74     |
-| 4   | 3     | Hat Open    | 39     | 51     | 63     | 75     |
-| 5   | 4     | Clap        | 40     | 52     | 64     | 76     |
-| 6   | 5     | Tom Low     | 41     | 53     | 65     | 77     |
-| 7   | 6     | Tom Mid     | 42     | 54     | 66     | 78     |
-| 8   | 7     | Tom High    | 43     | 55     | 67     | 79     |
-| 9   | 8     | Rim         | 44     | 56     | 68     | 80     |
-| 10  | 9     | Cowbell     | 45     | 57     | 69     | 81     |
-| 11  | 10    | Shaker      | 46     | 58     | 70     | 82     |
-| 12  | 11    | Claves      | 47     | 59     | 71     | 83     |
-| 13  | 12    | Maracas     | 48     | 60     | 72     | 84     |
-| 14  | 13    | Crash       | 49     | 61     | 73     | 85     |
-| 15  | 14    | Ride        | 50     | 62     | 74     | 86     |
-| 16  | 15    | Perc        | 51     | 63     | 75     | 87     |
+| 1   | 0     | Kick        | 36     | 52     | 68     | 84     |
+| 2   | 1     | Snare       | 37     | 53     | 69     | 85     |
+| 3   | 2     | Hat Closed  | 38     | 54     | 70     | 86     |
+| 4   | 3     | Hat Open    | 39     | 55     | 71     | 87     |
+| 5   | 4     | Clap        | 40     | 56     | 72     | 88     |
+| 6   | 5     | Tom Low     | 41     | 57     | 73     | 89     |
+| 7   | 6     | Tom Mid     | 42     | 58     | 74     | 90     |
+| 8   | 7     | Tom High    | 43     | 59     | 75     | 91     |
+| 9   | 8     | Rim         | 44     | 60     | 76     | 92     |
+| 10  | 9     | Cowbell     | 45     | 61     | 77     | 93     |
+| 11  | 10    | Shaker      | 46     | 62     | 78     | 94     |
+| 12  | 11    | Claves      | 47     | 63     | 79     | 95     |
+| 13  | 12    | Maracas     | 48     | 64     | 80     | 96     |
+| 14  | 13    | Crash       | 49     | 65     | 81     | 97     |
+| 15  | 14    | Ride        | 50     | 66     | 82     | 98     |
+| 16  | 15    | Perc        | 51     | 67     | 83     | 99     |
 
 ### 4.2 Faders, knobs & control buttons
 

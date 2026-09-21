@@ -12,15 +12,10 @@ DynamicSequencerPad::DynamicSequencerPad (PluginAudioProcessor& p, int lane, int
 {
     velocityParameterID = PluginAudioProcessor::laneStepVelParameterID (laneIndex, stepIndex);
     velocityParameter   = processor.getLaneStepVelParameter (laneIndex, stepIndex);
-
-    if (velocityParameter != nullptr)
-        processor.getAPVTS ().addParameterListener (velocityParameterID, this);
 }
 
 DynamicSequencerPad::~DynamicSequencerPad ()
 {
-    if (velocityParameter != nullptr)
-        processor.getAPVTS ().removeParameterListener (velocityParameterID, this);
 }
 
 float DynamicSequencerPad::getVelocity127 () const
@@ -41,6 +36,20 @@ void DynamicSequencerPad::setVelocity01 (float velocity01)
 
     if (velocityParameter != nullptr)
         velocityParameter->setValueNotifyingHost (clamped);
+
+    refreshFromEngine ();
+}
+
+void DynamicSequencerPad::refreshFromEngine ()
+{
+    const float velocity01 = processor.getStepVelocity (laneIndex, stepIndex);
+    const int   currentStep = processor.getCurrentStep (laneIndex);
+
+    if (velocity01 == lastPaintedVelocity && currentStep == lastPaintedStep)
+        return;
+
+    lastPaintedVelocity = velocity01;
+    lastPaintedStep     = currentStep;
 
     repaint ();
 }
@@ -102,9 +111,14 @@ void DynamicSequencerPad::paint (juce::Graphics& g)
     }
 }
 
-void DynamicSequencerPad::mouseDown (const juce::MouseEvent&)
+void DynamicSequencerPad::mouseDown (const juce::MouseEvent& event)
 {
     const float velocity127 = getVelocity127 ();
+
+    // Wrap the whole interaction (toggle + vertical drag) in a single
+    // parameter change gesture so DAW undo history groups it into one step.
+    if (velocityParameter != nullptr)
+        velocityParameter->beginChangeGesture ();
 
     if (velocity127 <= 0.0f)
     {
@@ -133,13 +147,10 @@ void DynamicSequencerPad::mouseDrag (const juce::MouseEvent& event)
     setVelocity127 (newVelocity127);
 }
 
-void DynamicSequencerPad::parameterChanged (const juce::String& paramID, float newValue)
+void DynamicSequencerPad::mouseUp (const juce::MouseEvent&)
 {
-    if (paramID != velocityParameterID)
-        return;
-
-    processor.setStepVelocity (laneIndex, stepIndex, newValue);
-    repaint ();
+    if (velocityParameter != nullptr)
+        velocityParameter->endChangeGesture ();
 }
 
 }

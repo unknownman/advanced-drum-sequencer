@@ -40,17 +40,17 @@ SequencerDesignSystem& SequencerDesignSystem::getDefault ()
 
 juce::Font SequencerDesignSystem::sequenceNumberFont ()
 {
-    return juce::Font (juce::FontOptions (9.0f));
+    return juce::Font (9.0f);
 }
 
 juce::Font SequencerDesignSystem::laneLabelFont ()
 {
-    return juce::Font (juce::FontOptions (12.0f));
+    return juce::Font (12.0f);
 }
 
 juce::Font SequencerDesignSystem::macroFont ()
 {
-    return juce::Font (juce::FontOptions (16.0f, juce::Font::FontStyleFlags::bold));
+    return juce::Font (16.0f, juce::Font::FontStyleFlags::bold);
 }
 
 juce::Path SequencerDesignSystem::makePadPath (const juce::Rectangle<float>& r, float radius,
@@ -204,17 +204,21 @@ void SequencerDesignSystem::drawRotarySlider (juce::Graphics& g, int x, int y, i
     const bool hot     = enabled && slider.isMouseOverOrDragging ();
 
     juce::Path track;
-    track.addArc (dial, rotaryStartAngle, rotaryEndAngle, true);
+    track.addArc (dial.getX (), dial.getY (), dial.getWidth (), dial.getHeight (),
+                  rotaryStartAngle, rotaryEndAngle, true);
     g.setColour (palette.text.withAlpha (enabled ? 0.20f : 0.10f));
     g.strokePath (track, juce::PathStrokeType (thickness));
 
     juce::Path valueArc;
-    valueArc.addArc (dial, rotaryStartAngle, angle, true);
+    valueArc.addArc (dial.getX (), dial.getY (), dial.getWidth (), dial.getHeight (),
+                     rotaryStartAngle, angle, true);
     g.setColour (palette.padOn.withAlpha (enabled ? (hot ? 1.0f : 0.85f) : 0.30f));
     g.strokePath (valueArc, juce::PathStrokeType (thickness));
 
-    const float cosine = std::cos (angle);
-    const float sine   = std::sin (angle);
+    constexpr float halfPi = juce::MathConstants<float>::halfPi;
+
+    const float cosine = std::cos (angle - halfPi);
+    const float sine   = std::sin (angle - halfPi);
 
     const float inner = outer - thickness * 0.95f;
     const float outerEdge = outer - thickness * 0.20f;
@@ -225,53 +229,62 @@ void SequencerDesignSystem::drawRotarySlider (juce::Graphics& g, int x, int y, i
                 thickness * 0.55f);
 }
 
-void SequencerDesignSystem::drawIncDecButtons (juce::Graphics& g, juce::Button& button,
-                                               bool isMouseOverButton, bool isButtonDown)
+class SequencerDesignSystem::IncDecButton final : public juce::Button
 {
-    const auto area = button.getLocalBounds ().toFloat ();
-
-    if (area.isEmpty ())
-        return;
-
-    const bool enabled = button.isEnabled ();
-
-    bool increment = true;
-
-    if (auto* incDec = dynamic_cast<juce::Slider::SliderIncDecButton*> (&button))
+public:
+    IncDecButton (const juce::String& name, bool shouldIncrement)
+        : juce::Button (name),
+          increment (shouldIncrement)
     {
-        increment = incDec->isIncrement ();
-    }
-    else
-    {
-        const auto prop = button.getProperties ()["isIncrement"].toString ().trim ().toLowerCase ();
-        if (prop.isNotEmpty ())
-            increment = prop == "1" || prop == "true" || prop == "yes" || prop == "on";
     }
 
-    auto fill = palette.padOff.brighter (isMouseOverButton ? 0.12f : 0.0f);
+    void paintButton (juce::Graphics& g, bool shouldDrawButtonAsHighlighted,
+                      bool shouldDrawButtonAsDown) override
+    {
+        const auto area = getLocalBounds ().toFloat ();
 
-    if (isButtonDown)
-        fill = palette.padOn.withAlpha (0.20f);
+        if (area.isEmpty ())
+            return;
 
-    g.setColour (fill.withAlpha (enabled ? 1.0f : 0.45f));
-    g.fillRoundedRectangle (area, kPadCornerRadius);
+        const bool enabled = isEnabled ();
 
-    g.setColour (palette.text.withAlpha (enabled ? 0.22f : 0.10f));
-    g.drawRoundedRectangle (area, kPadCornerRadius, 1.0f);
+        auto fill = SequencerDesignSystem::palette.padOff.brighter (
+            shouldDrawButtonAsHighlighted ? 0.12f : 0.0f);
 
-    juce::Path chevron;
+        if (shouldDrawButtonAsDown)
+            fill = SequencerDesignSystem::palette.padOn.withAlpha (0.20f);
 
-    const float cx = area.getCentreX ();
-    const float cy = area.getCentreY ();
-    const float sz = juce::jmin (area.getWidth (), area.getHeight ()) * 0.42f;
+        g.setColour (fill.withAlpha (enabled ? 1.0f : 0.45f));
+        g.fillRoundedRectangle (area, SequencerDesignSystem::kPadCornerRadius);
 
-    if (increment)
-        chevron.addTriangle (cx - sz * 0.60f, cy + sz * 0.28f, cx + sz * 0.60f, cy + sz * 0.28f, cx, cy - sz * 0.40f);
-    else
-        chevron.addTriangle (cx - sz * 0.60f, cy - sz * 0.28f, cx + sz * 0.60f, cy - sz * 0.28f, cx, cy + sz * 0.40f);
+        g.setColour (SequencerDesignSystem::palette.text.withAlpha (enabled ? 0.22f : 0.10f));
+        g.drawRoundedRectangle (area, SequencerDesignSystem::kPadCornerRadius, 1.0f);
 
-    g.setColour (palette.text.withAlpha (enabled ? (isButtonDown ? 1.0f : 0.90f) : 0.35f));
-    g.fillPath (chevron);
+        const float cx = area.getCentreX ();
+        const float cy = area.getCentreY ();
+        const float sz = juce::jmin (area.getWidth (), area.getHeight ()) * 0.42f;
+
+        juce::Path chevron;
+
+        if (increment)
+            chevron.addTriangle (cx - sz * 0.60f, cy + sz * 0.28f, cx + sz * 0.60f, cy + sz * 0.28f, cx, cy - sz * 0.40f);
+        else
+            chevron.addTriangle (cx - sz * 0.60f, cy - sz * 0.28f, cx + sz * 0.60f, cy - sz * 0.28f, cx, cy + sz * 0.40f);
+
+        g.setColour (SequencerDesignSystem::palette.text.withAlpha (
+            enabled ? (shouldDrawButtonAsDown ? 1.0f : 0.90f) : 0.35f));
+        g.fillPath (chevron);
+    }
+
+private:
+    const bool increment;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (IncDecButton)
+};
+
+juce::Button* SequencerDesignSystem::createSliderButton (juce::Slider& slider, bool isIncrement)
+{
+    return new IncDecButton (isIncrement ? "inc-button" : "dec-button", isIncrement);
 }
 
 float SequencerDesignSystem::getPadVelocity (const juce::Button& button) const

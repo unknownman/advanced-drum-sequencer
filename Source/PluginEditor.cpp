@@ -218,9 +218,11 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
         button->getProperties ().set ("padLabelCentre", "1");
         button->setTooltip ("Switch the 16 lane note assignments to bank "
                             + juce::String (bankNames[bank]));
-        button->onClick = [this, bank]
+
+        juce::ToggleButton* buttonPtr = button.get ();
+        buttonPtr->onClick = [this, buttonPtr, bank]
         {
-            if (button->getToggleState ())
+            if (buttonPtr->getToggleState ())
                 processor.setActiveNoteBank (bank);
         };
         addAndMakeVisible (*button);
@@ -286,12 +288,25 @@ void PluginAudioEditor::updatePlayhead ()
         return;
 
     if (lastPlayheadStep >= 0)
-        padGrid[(size_t) selectedLane][(size_t) lastPlayheadStep]->repaint ();
+        padGrid[(size_t) selectedLane][(size_t) lastPlayheadStep]->refreshFromEngine ();
 
     if (currentStep >= 0)
-        padGrid[(size_t) selectedLane][(size_t) currentStep]->repaint ();
+        padGrid[(size_t) selectedLane][(size_t) currentStep]->refreshFromEngine ();
 
     lastPlayheadStep = currentStep;
+}
+
+void PluginAudioEditor::refreshVisiblePads ()
+{
+    for (int pad = 0; pad < kPadsPerLane; ++pad)
+        padGrid[(size_t) selectedLane][(size_t) pad]->refreshFromEngine ();
+}
+
+void PluginAudioEditor::timerCallback ()
+{
+    updateTrackHeaders ();
+    updatePlayhead ();
+    refreshVisiblePads ();
 }
 
 void PluginAudioEditor::paint (juce::Graphics& g)

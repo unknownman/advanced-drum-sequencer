@@ -34,6 +34,7 @@ private:
     void showLane (int laneIndex);
     void updateTrackHeaders ();
     void updatePlayhead ();
+    void refreshVisiblePads ();
 
     PluginAudioProcessor& processor;
     SequencerDesignSystem lookAndFeel;

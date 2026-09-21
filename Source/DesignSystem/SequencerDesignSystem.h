@@ -58,8 +58,7 @@ public:
                            float sliderPosProportional, float rotaryStartAngle,
                            float rotaryEndAngle, juce::Slider&) override;
 
-    void drawIncDecButtons (juce::Graphics&, juce::Button&,
-                            bool isMouseOverButton, bool isButtonDown) override;
+    juce::Button* createSliderButton (juce::Slider& slider, bool isIncrement) override;
 
 protected:
     virtual float        getPadVelocity (const juce::Button&) const;
@@ -68,6 +67,8 @@ protected:
     virtual juce::String getPadLabelText (const juce::Button&) const;
 
 private:
+    class IncDecButton;
+
     static juce::Path makePadPath (const juce::Rectangle<float>&, float radius, int connectedEdgeFlags);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SequencerDesignSystem)

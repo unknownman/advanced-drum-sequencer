@@ -52,10 +52,11 @@ except ImportError:
 
 from _Framework.InputControlElement import MIDI_CC_TYPE, MIDI_NOTE_TYPE
 
-from MPD32SequencerMap import (FADER_CC_BASE, FADER_COUNT, KNOB_CC_BASE,
-                               KNOB_COUNT, BUTTON_CC_BASE, BUTTON_COUNT,
-                               PAD_NOTE_BASE, PAD_NOTE_COUNT, CONTROL_CHANNEL,
-                               NOTE_CHANNEL, control_param_index)
+from . import MPD32SequencerMap
+from .MPD32SequencerMap import (FADER_CC_BASE, FADER_COUNT, KNOB_CC_BASE,
+                                KNOB_COUNT, BUTTON_CC_BASE, BUTTON_COUNT,
+                                PAD_NOTE_BASE, PAD_NOTE_COUNT, CONTROL_CHANNEL,
+                                NOTE_CHANNEL, control_param_index, param_name)
 
 MAX_PAGE = 31
 
@@ -109,6 +110,36 @@ def _midi_byte(value):
     return int(round(max(0.0, min(1.0, raw)) * 127.0))
 
 
+def find_parameter_by_name(device, name):
+    """Resolve a live DeviceParameter by its String Name.
+
+    Ableton caps the device object model at a 128-parameter window, so the
+    canonical drumSeq names (from MPD32SequencerMap.param_name) are matched
+    against the exposed parameters as a first strategy. Falls back to position
+    when a name cannot be matched.
+    """
+    if device is None or name is None:
+        return None
+    params = getattr(device, 'parameters', None) or []
+    for param in params:
+        if getattr(param, 'name', None) == name:
+            return param
+    return None
+
+
+def _device_parameter(device, param_index):
+    """Resolve a VST parameter by name first, then by positional index."""
+    if device is None:
+        return None
+    named = find_parameter_by_name(device, param_name(param_index))
+    if named is not None:
+        return named
+    params = getattr(device, 'parameters', None) or []
+    if 0 <= param_index < len(params):
+        return params[param_index]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # SequencerDeviceComponent - track-focus aware VST parameter binder
 # ---------------------------------------------------------------------------
@@ -153,6 +184,11 @@ class SequencerDeviceComponent(Component):
             self._page = page
             self._rebind(force_feedback=True)
 
+    def set_device(self, device):
+        """(Re)target the components to a sequenced drumSeq instance."""
+        self._device = device
+        self._rebind()
+
     # -- (de)registration -------------------------------------------------
     def _teardown(self):
         for element, callback in self._element_listeners:
@@ -177,8 +213,7 @@ class SequencerDeviceComponent(Component):
             return
 
         param_index = control_param_index(self._page, slot)
-        params = getattr(self._device, 'parameters', None) or []
-        param = params[param_index] if param_index < len(params) else None
+        param = _device_parameter(self._device, param_index)
 
         element_cb = lambda value, p=param: self._set_parameter(p, value)
         element.add_value_listener(element_cb)

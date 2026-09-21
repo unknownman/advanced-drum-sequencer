@@ -38,7 +38,8 @@ HARDWARE_PAD_BANK_OFFSETS = (0, 12, 24, 36)
 
 # The engine's four software note banks (kNumNoteBanks). Values are matched
 # to the hardware bank offsets so pedals, pads and the plugin see one system.
-ENGINE_NOTE_BANK_BASE = (36, 48, 60, 72)  # 36 + lane + bank * 12
+# Each bank shifts the lane notes by 16 to align with Ableton 16-pad Drum Racks.
+ENGINE_NOTE_BANK_BASE = (36, 52, 68, 84)  # 36 + lane + bank * 16
 
 # F1..F8 faders -> CC 12..19
 FADER_CC_BASE = 12
@@ -88,6 +89,22 @@ def lane_step_from_param_index(param_index):
         return None
     offset = param_index - 1
     return (offset // AUTOMATED_STEP_COUNT, offset % AUTOMATED_STEP_COUNT)
+
+
+def param_name(param_index):
+    """Canonical VST parameter name for a parameter index.
+
+    Mirrors the C++ AudioParameterFloat names so the remote script can resolve
+    parameters by String Name (Ableton exposes only a 128-parameter window on
+    the device object model) instead of relying purely on position.
+    """
+    if param_index == SWING_PARAM_INDEX:
+        return 'Swing'
+    spec = lane_step_from_param_index(param_index)
+    if spec is None:
+        return None
+    lane, step = spec
+    return 'Lane %d Step %d Velocity' % (lane + 1, step + 1)
 
 
 _STEPS_PER_PAGE = 16
