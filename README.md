@@ -10,7 +10,7 @@ control surface profile.
 │  ┌───────────────────────┐   ┌───────────────────────────────────────┐ │
 │  │ drumSeq (VST3/AU)     │   │ MPD32Sequencer MIDI Remote Script     │ │
 │  │  - lock-free 16×64 RT │   │  - MPD32 USB handshake (SysEx ID)     │ │
-│  │  - APVTS 513 params   │◄──►│  - fader/knob → VST param binding   │ │
+│  │  - APVTS 1233 params  │◄──►│  - fader/knob → VST param binding   │ │
 │  │  - Metal-backed UI    │   │  - selected-track focus routing       │ │
 │  └───────────────────────┘   └───────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -85,6 +85,39 @@ through the **Metal** GPU backend; all geometry is emitted as `juce::Path`
 vectors, so the 512-pad master grid (16 lanes × 32 steps) and its playhead
 tracking repaint are GPU-composited with no texture churn.
 
+### 1.4 Parametric internal synthesis engine
+
+Standalone (and DAW fallback) audio is produced by a pre-allocated, 16-voice
+internal drum synthesizer (`kDrumVoiceCount == 16`, round-robin voice-stealing)
+that never touches the heap after `prepareToPlay()`. Every voice runs a
+fully-polyphonic **exponential amplitude envelope** whose decay and release
+stages drop along the logarithmic contour
+
+```
+amp(t) = e^(-t/τ),   τ = decay / release time constant (in seconds)
+```
+
+computed once per sample with a constant multiplier (`e^{-1/(τ·fs)}`) — **no
+`exp()` is ever evaluated inside the render loop**, and the attack stage snaps
+the transient then hands off to the decay curve toward the sustain level.
+
+* **Lock-free LFO modulation** — each lane caches LFO rate, depth and waveform
+  as `std::atomic<float>*` pointers (`SynthParamChannel`); the editor writes
+  them through `SliderAttachment`/`ComboBoxAttachment` and the audio thread
+  reads them with `memory_order_relaxed`. LFO phase advances per-sample against
+  `lfo_rate / sampleRate` and modulates the oscillator pitch through the
+  header-only `FastMathApproximations` sine (with triangle / sawtooth
+  alternate planes) — zero allocations, zero locks.
+* **Xorshift dark-noise colour filters** — a 32-bit xorshift PRNG drives the
+  white-noise texture; each model then shapes the noise (first-order low-pass
+  "darkening" coefficient derived from the lane's `noise_blend`; band-pass +
+  180 Hz tone for the snare; high-pass for the hi-hat), so noise tails are
+  colored and organic rather than brittle walls of white.
+* **Model archetypes** — kick (sine-phase carrier with exponential pitch
+  sweep), snare (band-passed noise + tone), hi-hat (high-passed noise); every
+  voice also captures per-lane pitch, ADSR and blend parameters atomically at
+  hit onset.
+
 ---
 
 ## 2. Repository Layout
@@ -93,12 +126,13 @@ tracking repaint are GPU-composited with no texture churn.
 drumSeq/
 ├── CMakeLists.txt                          # AU + VST3 + Standalone, universal binary
 ├── Source/
-│   ├── PluginProcessor.h / .cpp            # lock-free engine + 513-param APVTS
+│   ├── PluginProcessor.h / .cpp            # lock-free engine + 1233-param APVTS
 │   ├── PluginEditor.h / .cpp               # master grid, sidebar, bank selector
 │   ├── DesignSystem/
 │   │   ├── SequencerDesignSystem.h / .cpp  # pads, rotary, inc/dec look-and-feel
 │   └── UI/
 │       ├── DynamicSequencerPad.h / .cpp    # multi-action velocity pad + playhead dot
+│       └── MidiDragExportComponent.h/.cpp  # OS-level drag-out MIDI export (.mid)
 │   └── Scripts/
 │       ├── __init__.py                     # Ableton Live MPD32Sequencer ControlSurface
 │       └── MPD32SequencerMap.py            # hardware↔VST parameter tables (pure Python)
@@ -116,16 +150,18 @@ drumSeq/
 | macOS                           | 14.4+          | `CMAKE_OSX_DEPLOYMENT_TARGET=14.4`     |
 | Xcode Command Line Tools        | 15.x+          | `xcode-select --install`               |
 | CMake                           | 3.22+          | `brew install cmake`                   |
-| JUCE                            | 7.x / 8.x      | `git clone --depth 1 --branch 8.0.0 …` |
+| JUCE                            | 8.0.15         | pinned (`git clone --branch 8.0.15 …`) |
 
 ### 3.2 One-time JUCE checkout
 
 ```bash
 cd /Users/alijoder/Desktop/Code/VST/drumSeq
-git clone --depth 1 --branch 8.0.0 https://github.com/juce-framework/JUCE.git juce
+git clone --depth 1 --branch 8.0.15 https://github.com/juce-framework/JUCE.git juce
 ```
 
-> Use any JUCE 7/8 tag; the build only needs the JUCE **library** (no Projucer).
+> JUCE is pinned to tag **8.0.15** for structural
+> `AudioParameterFloatAttributes` compatibility; upstream JUCE 7.x is not a
+> supported baseline for this build.
 
 ### 3.3 Configure a Universal Binary (arm64 + x86_64) Xcode project
 
@@ -146,19 +182,19 @@ cmake -B build \
 cmake --build build --config Release
 ```
 
-Generated products (default CMake/JUCE paths):
+Generated products (Release, Xcode multi-config `drumSeq_artefacts` paths):
 
 ```
-build/Release/drumSeq.component
-build/Release/drumSeq.vst3
-build/Release/drumSeq.app
+build/drumSeq_artefacts/Release/AU/drumSeq.component         (universal .component)
+build/drumSeq_artefacts/Release/VST3/drumSeq.vst3             (universal .vst3)
+build/drumSeq_artefacts/Release/Standalone/drumSeq.app        (universal .app)
 ```
 
 Verify the binary actually contains both slices:
 
 ```bash
-lipo -info build/Release/drumSeq.vst3/Contents/MacOS/drumSeq
-# -> Architectures in the fat file: build/Release/drumSeq.vst3/Contents/MacOS/drumSeq are: x86_64 arm64
+lipo -info build/drumSeq_artefacts/Release/VST3/drumSeq.vst3/Contents/MacOS/drumSeq
+# -> Architectures in the fat file: ... are: x86_64 arm64
 ```
 
 ### 3.5 Ad-hoc codesign (local development)
@@ -166,16 +202,16 @@ lipo -info build/Release/drumSeq.vst3/Contents/MacOS/drumSeq
 macOS requires valid code signatures to load audio plug-ins:
 
 ```bash
-codesign --force --deep --sign - build/Release/drumSeq.component
-codesign --force --deep --sign - build/Release/drumSeq.vst3
+codesign --force --deep --sign - build/drumSeq_artefacts/Release/AU/drumSeq.component
+codesign --force --deep --sign - build/drumSeq_artefacts/Release/VST3/drumSeq.vst3
 ```
 
 ### 3.6 Install for Ableton Live
 
 ```bash
 mkdir -p ~/Library/Audio/Plug-Ins/Components ~/Library/Audio/Plug-Ins/VST3
-ditto build/Release/drumSeq.component ~/Library/Audio/Plug-Ins/Components/drumSeq.component
-ditto build/Release/drumSeq.vst3    ~/Library/Audio/Plug-Ins/VST3/drumSeq.vst3
+ditto build/drumSeq_artefacts/Release/AU/drumSeq.component ~/Library/Audio/Plug-Ins/Components/drumSeq.component
+ditto build/drumSeq_artefacts/Release/VST3/drumSeq.vst3    ~/Library/Audio/Plug-Ins/VST3/drumSeq.vst3
 ```
 
 Then restart Ableton Live (or rescan plug-ins) — `drumSeq` appears under
@@ -258,16 +294,23 @@ All controls are **MIDI CC, channel 1**. Two operational modes exist:
 
 ### 4.3 VST parameter index model
 
-The plug-in's `AudioProcessorValueTreeState` registers **513 automatable
-parameters** in exact order:
+The plug-in's `AudioProcessorValueTreeState` registers **1233 automatable,
+host-visible parameters**, every one pre-cached to a `std::atomic<float>*` so
+the audio thread never performs string lookups:
 
-| Param index | ID                         | Meaning                          |
-| ----------- | -------------------------- | -------------------------------- |
-| 0           | `swing`                    | swing amount 0..1               |
-| `1 + lane·32 + step` | `lane_<lane>_step_<step>_vel` | per-step velocity (0..127, exposed as 0..1) |
+| Count | ID pattern                                   | Meaning                                  |
+| ----- | -------------------------------------------- | ---------------------------------------- |
+| 1     | `swing`                                      | swing amount 0..1                        |
+| 512   | `lane_<lane>_step_<step>_vel`               | per-step velocity (normalized 0..1 = 0..127) |
+| 512   | `lane_<lane>_step_<step>_prob`              | per-step trigger probability (0..1, gate in `renderLaneHit`) |
+| 144   | `lane_<lane>_<synth_param>`                 | parametric synth: pitch, attack, decay, sustain, release, LFO rate/depth/wave, noise blend (9 × 16 lanes) |
+| 64    | `lane_<lane>_euclidean_pulses` / `..._steps` | Björklund Euclidean macro pair per lane (32 × 2) |
 
-In Live Script mode the 16 control slots are paged over those parameters
-(`B1`/`B2`), slot `s` on page `p` mapping to:
+The legacy velocity bus retains its exact layout: **index 0 is `swing`**, then
+`1 + lane·32 + step` addressing over the 512 per-step velocity states (`lane`
+0..15, `step` 0..31), as clocked per §1.2. In Live Script mode the 16 control
+slots are paged over those parameters (`B1`/`B2`), slot `s` on page `p` mapping
+to:
 
 ```
 page 0:     s == 0 → param 0 (swing),  else → param s
