@@ -184,6 +184,25 @@ Then restart Ableton Live (or rescan plug-ins) — `drumSeq` appears under
 > Note: for distribution, replace the ad-hoc signature with an Apple
 > Developer ID + notarization.
 
+### 3.7 One-shot automation: build_mac.sh
+
+`build_mac.sh` wraps §3.3–§3.6 + the Ableton remote-script install into a single
+audited pipeline: dependency check, universal-slice `lipo` enforcement, ad-hoc
+deep codesigning, and ditto install with platform prompts:
+
+```bash
+./build_mac.sh -y              # audit, configure, build, slice-verify, codesign, install
+./build_mac.sh --no-install    # compile + verify only
+JUCE_DIR=/path/to/JUCE ./build_mac.sh
+```
+
+It runs the zero-dependency Live remote-script suite automatically; run it
+standalone any time:
+
+```bash
+python3 -m unittest discover -s Source/Tests -p 'test_*.py'
+```
+
 ---
 
 ## 4. Hardware Integration Map
