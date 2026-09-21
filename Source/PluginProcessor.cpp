@@ -29,7 +29,28 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
                                                              juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f),
                                                              0.5f));
 
+    for (int lane = 0; lane < kNumLanes; ++lane)
+        for (int step = 0; step < kAutomationStepCount; ++step)
+            layout.add (std::make_unique<juce::AudioParameterFloat> (
+                laneStepVelParameterID (lane, step),
+                "Lane " + juce::String (lane + 1) + " Step " + juce::String (step + 1) + " Velocity",
+                juce::NormalisableRange<float> (0.0f, 127.0f, 0.01f),
+                0.0f));
+
     return layout;
+}
+
+juce::String PluginAudioProcessor::laneStepVelParameterID (int lane, int step)
+{
+    return juce::String::formatted ("lane_%d_step_%d_vel", lane, step);
+}
+
+juce::RangedAudioParameter* PluginAudioProcessor::getLaneStepVelParameter (int lane, int step)
+{
+    if (lane < 0 || lane >= kNumLanes || step < 0 || step >= kAutomationStepCount)
+        return nullptr;
+
+    return apvts.getParameter (laneStepVelParameterID (lane, step));
 }
 
 void PluginAudioProcessor::initialiseCaches ()

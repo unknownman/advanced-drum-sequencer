@@ -1,11 +1,13 @@
 #pragma once
 
 #include <array>
+#include <memory>
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "DesignSystem/SequencerDesignSystem.h"
 #include "PluginProcessor.h"
+#include "UI/DynamicSequencerPad.h"
 
 namespace drumseq
 {
@@ -25,7 +27,7 @@ private:
 
     juce::Label globalTitle;
 
-    std::array<juce::ToggleButton, 8> pads;
+    std::array<std::unique_ptr<DynamicSequencerPad>, 16> stepPads;
 
     juce::Label swingLabel;
     juce::Slider swingSlider;

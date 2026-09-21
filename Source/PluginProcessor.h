@@ -14,6 +14,7 @@ class PluginAudioProcessor final : public juce::AudioProcessor,
 public:
     static constexpr int kNumLanes      = 16;
     static constexpr int kMaxStepsPerLane = 64;
+    static constexpr int kAutomationStepCount = 32;
     static constexpr int kBasicChannel  = 1;
 
     PluginAudioProcessor ();
@@ -39,6 +40,9 @@ public:
     void parameterChanged (const juce::String&, float) override;
 
     juce::AudioProcessorValueTreeState& getAPVTS () noexcept { return apvts; }
+
+    static juce::String laneStepVelParameterID (int lane, int step);
+    juce::RangedAudioParameter* getLaneStepVelParameter (int lane, int step);
 
     void setStepVelocity (int lane, int step, float value);
     float getStepVelocity (int lane, int step) const;

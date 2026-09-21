@@ -16,20 +16,17 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
     globalTitle.setText ("drumSeq", juce::dontSendNotification);
     addAndMakeVisible (globalTitle);
 
-    for (int i = 0; i < (int) pads.size (); ++i)
+    for (int step = 0; step < (int) stepPads.size (); ++step)
     {
-        auto& pad = pads[(size_t) i];
-
-        pad.getProperties().set ("padLabel", juce::String (i + 1).paddedLeft ('0', 2));
-        pad.getProperties().set ("velocity", 0.30f + (i % 3) * 0.28f);
-
-        pad.setToggleState (i % 3 == 0, juce::dontSendNotification);
-
-        addAndMakeVisible (pad);
+        auto pad = std::make_unique<DynamicSequencerPad> (processor, 0, step);
+        addAndMakeVisible (*pad);
+        stepPads[(size_t) step] = std::move (pad);
     }
 
-    pads[6].getProperties().set ("midiLearn", true);
-    pads[6].setToggleState (false, juce::dontSendNotification);
+    const int demoSteps[] = { 0, 4, 8, 10, 12 };
+
+    for (const int step : demoSteps)
+        stepPads[(size_t) step]->setVelocity127 (96.0f);
 
     swingLabel.setFont (SequencerDesignSystem::laneLabelFont ());
     swingLabel.setColour (juce::Label::textColourId, SequencerDesignSystem::palette.text);
@@ -85,24 +82,20 @@ void PluginAudioEditor::resized ()
 
     globalTitle.setBounds (area.removeFromTop (22));
 
-    const auto padArea = area.removeFromTop (92);
+    const auto padArea = area.removeFromTop (64);
 
     constexpr float gap = 4.0f;
-    constexpr int columns = 4;
-    constexpr int rows = 2;
+    const int count     = (int) stepPads.size ();
+    const float cell    = (padArea.getWidth () - gap * (float) (count - 1)) / (float) count;
 
-    const float cell = juce::jmin ((padArea.getWidth () - gap * (float) (columns - 1)) / (float) columns,
-                                   (padArea.getHeight () - gap * (float) (rows - 1)) / (float) rows);
-
-    for (int i = 0; i < (int) pads.size (); ++i)
+    for (int i = 0; i < count; ++i)
     {
-        const int column = i % columns;
-        const int row    = i / columns;
+        const int cellWidth = juce::roundToInt (cell);
 
-        pads[(size_t) i].setBounds (padArea.getX () + juce::roundToInt (column * (cell + gap)),
-                                    padArea.getY () + juce::roundToInt ((float) row * (cell + gap)),
-                                    juce::roundToInt (cell),
-                                    juce::roundToInt (cell));
+        stepPads[(size_t) i]->setBounds (padArea.getX () + juce::roundToInt (i * (cell + gap)),
+                                         padArea.getY (),
+                                         cellWidth,
+                                         padArea.getHeight ());
     }
 
     auto controls = area.removeFromTop (78);

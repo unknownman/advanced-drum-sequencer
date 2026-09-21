@@ -50,12 +50,14 @@ target_sources (drumSeq PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
     Source/DesignSystem/SequencerDesignSystem.cpp
+    Source/UI/DynamicSequencerPad.cpp
 )
 
 target_sources (drumSeq PRIVATE
     Source/PluginProcessor.h
     Source/PluginEditor.h
     Source/DesignSystem/SequencerDesignSystem.h
+    Source/UI/DynamicSequencerPad.h
 )
 
 if (NOT CMAKE_BUILD_TYPE)
