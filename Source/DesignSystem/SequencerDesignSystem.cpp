@@ -165,9 +165,19 @@ void SequencerDesignSystem::drawToggleButton (juce::Graphics& g, juce::ToggleBut
     {
         g.setFont (sequenceNumberFont ());
         g.setColour (palette.text.withAlpha (enabled ? 0.85f : 0.35f));
-        g.drawText (label,
-                    area.withTrimmedTop (2.5f).withTrimmedLeft (3.0f).withTrimmedRight (1.0f).toNearestInt (),
-                    juce::Justification::topLeft);
+
+        if (isPadLabelCentred (button))
+        {
+            g.drawText (label,
+                        area.withTrimmedTop (2.0f).withTrimmedBottom (2.0f).toNearestInt (),
+                        juce::Justification::centred);
+        }
+        else
+        {
+            g.drawText (label,
+                        area.withTrimmedTop (2.5f).withTrimmedLeft (3.0f).withTrimmedRight (1.0f).toNearestInt (),
+                        juce::Justification::topLeft);
+        }
     }
 }
 
@@ -278,6 +288,17 @@ float SequencerDesignSystem::getPadVelocity (const juce::Button& button) const
 bool SequencerDesignSystem::isMIDILearnActive (const juce::Button& button) const
 {
     const auto value = button.getProperties ()["midiLearn"];
+
+    if (value.isVoid () || value.isUndefined ())
+        return false;
+
+    const auto text = value.toString ().trim ().toLowerCase ();
+    return text == "1" || text == "true" || text == "yes" || text == "on";
+}
+
+bool SequencerDesignSystem::isPadLabelCentred (const juce::Button& button) const
+{
+    const auto value = button.getProperties ()["padLabelCentre"];
 
     if (value.isVoid () || value.isUndefined ())
         return false;

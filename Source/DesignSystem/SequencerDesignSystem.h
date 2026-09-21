@@ -64,6 +64,7 @@ public:
 protected:
     virtual float        getPadVelocity (const juce::Button&) const;
     virtual bool         isMIDILearnActive (const juce::Button&) const;
+    virtual bool         isPadLabelCentred (const juce::Button&) const;
     virtual juce::String getPadLabelText (const juce::Button&) const;
 
 private:

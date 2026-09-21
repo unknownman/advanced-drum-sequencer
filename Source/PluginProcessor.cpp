@@ -71,10 +71,19 @@ void PluginAudioProcessor::resetPatternData ()
     swingParamCache.store (0.5f, std::memory_order_relaxed);
     fallbackBpmCache.store (120.0, std::memory_order_relaxed);
 
+    activeNoteBank.store (0, std::memory_order_relaxed);
+    mpdLaneBank.store (0, std::memory_order_relaxed);
+
+    for (int bank = 0; bank < kNumNoteBanks; ++bank)
+        for (int lane = 0; lane < kNumLanes; ++lane)
+            noteBankCaches[(size_t) bank][(size_t) lane].store (36 + lane + bank * 12, std::memory_order_relaxed);
+
     for (int lane = 0; lane < kNumLanes; ++lane)
     {
         loopLengthCaches[(size_t) lane].store (16, std::memory_order_relaxed);
         targetNoteCaches[(size_t) lane].store (36 + lane, std::memory_order_relaxed);
+        velocityScaleCaches[(size_t) lane].store (1.0f, std::memory_order_relaxed);
+        currentStepCaches[(size_t) lane].store (-1, std::memory_order_relaxed);
 
         for (int step = 0; step < kMaxStepsPerLane; ++step)
             stepVelocityCaches[(size_t) lane][(size_t) step].store (0.0f, std::memory_order_relaxed);
@@ -98,6 +107,8 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     juce::ScopedNoDenormals noDenormals;
 
     buffer.clear ();
+
+    processHardwareController (midiMessages);
 
     maybeProcessMIDILearn (midiMessages);
 
@@ -151,9 +162,47 @@ void PluginAudioProcessor::maybeProcessMIDILearn (juce::MidiBuffer& midiMessages
             continue;
 
         targetNoteCaches[(size_t) laneToLearn].store (message.getNoteNumber (), std::memory_order_relaxed);
+        noteBankCaches[(size_t) activeNoteBank.load (std::memory_order_relaxed)][(size_t) laneToLearn].store (
+            message.getNoteNumber (), std::memory_order_relaxed);
         laneInLearnMode.store (-1, std::memory_order_relaxed);
         midiMessages.clear ();
         return;
+    }
+}
+
+void PluginAudioProcessor::processHardwareController (juce::MidiBuffer& midiMessages)
+{
+    const int laneBank = mpdLaneBank.load (std::memory_order_relaxed) != 0 ? 8 : 0;
+
+    for (const auto& metadata : midiMessages)
+    {
+        const auto& message = metadata.getMessage ();
+
+        if (! message.isController ())
+            continue;
+
+        const int cc    = message.getControllerNumber ();
+        const int value = message.getControllerValue ();
+
+        if (cc >= 12 && cc <= 19)
+        {
+            const int lane = (cc - 12) + laneBank;
+            setVelocityScale (lane, value / 127.0f);
+        }
+        else if (cc >= 22 && cc <= 29)
+        {
+            const int lane = (cc - 22) + laneBank;
+            setLoopLength (lane, value);
+        }
+        else if (cc >= 32 && cc <= 39)
+        {
+            const int lane = (cc - 32) + laneBank;
+
+            if (getLaneInLearnMode () == lane)
+                disarmMIDILearn ();
+            else
+                armMIDILearn (lane);
+        }
     }
 }
 
@@ -214,9 +263,11 @@ void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int la
 
     lastSteps[lane] = laneStep;
 
-    const float velocity = stepVelocityCaches[(size_t) lane][(size_t) laneStep].load (std::memory_order_relaxed);
+    currentStepCaches[(size_t) lane].store (laneStep, std::memory_order_relaxed);
 
-    if (velocity <= 0.0f)
+    const float velocity01 = stepVelocityCaches[(size_t) lane][(size_t) laneStep].load (std::memory_order_relaxed);
+
+    if (velocity01 <= 0.0f)
         return;
 
     const int midiNote = targetNoteCaches[(size_t) lane].load (std::memory_order_relaxed);
@@ -231,7 +282,9 @@ void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int la
                                  : (int) std::lround (samplesPerStep * (double) swing * 0.5);
 
     const int samplePos     = juce::jlimit (0, numSamples, baseSample + swingSamples);
-    const int velocityMidi  = juce::jlimit (1, 127, (int) std::lround (velocity * 127.0f));
+    const float scale       = juce::jlimit (0.0f, 1.0f,
+                                            velocityScaleCaches[(size_t) lane].load (std::memory_order_relaxed));
+    const int velocityMidi  = juce::jlimit (1, 127, (int) std::lround (velocity01 * scale * 127.0f));
 
     midiMessages.addEvent (juce::MidiMessage::noteOn (kBasicChannel, midiNote, (juce::uint8) velocityMidi),
                            samplePos);
@@ -248,6 +301,9 @@ void PluginAudioProcessor::stopAndFlush (juce::MidiBuffer& midiMessages)
     {
         midiMessages.addEvent (juce::MidiMessage::allNotesOff (kBasicChannel), 0);
         wasPlayingLast = false;
+
+        for (int lane = 0; lane < kNumLanes; ++lane)
+            currentStepCaches[(size_t) lane].store (-1, std::memory_order_relaxed);
     }
 
     timelinePrimed = false;
@@ -324,6 +380,69 @@ void PluginAudioProcessor::setSwing (float value)
 float PluginAudioProcessor::getSwing () const
 {
     return swingParamCache.load (std::memory_order_relaxed);
+}
+
+void PluginAudioProcessor::setVelocityScale (int lane, float value)
+{
+    if (lane < 0 || lane >= kNumLanes)
+        return;
+
+    velocityScaleCaches[(size_t) lane].store (juce::jlimit (0.0f, 1.0f, value), std::memory_order_relaxed);
+}
+
+float PluginAudioProcessor::getVelocityScale (int lane) const
+{
+    if (lane < 0 || lane >= kNumLanes)
+        return 1.0f;
+
+    return velocityScaleCaches[(size_t) lane].load (std::memory_order_relaxed);
+}
+
+void PluginAudioProcessor::setActiveNoteBank (int bank)
+{
+    const int clampedBank = juce::jlimit (0, kNumNoteBanks - 1, bank);
+
+    activeNoteBank.store (clampedBank, std::memory_order_relaxed);
+
+    for (int lane = 0; lane < kNumLanes; ++lane)
+        targetNoteCaches[(size_t) lane].store (
+            noteBankCaches[(size_t) clampedBank][(size_t) lane].load (std::memory_order_relaxed),
+            std::memory_order_relaxed);
+}
+
+int PluginAudioProcessor::getActiveNoteBank () const noexcept
+{
+    return activeNoteBank.load (std::memory_order_relaxed);
+}
+
+void PluginAudioProcessor::setBankNote (int bank, int lane, int midiNote)
+{
+    if (lane < 0 || lane >= kNumLanes)
+        return;
+
+    const int clampedBank = juce::jlimit (0, kNumNoteBanks - 1, bank);
+    const int note        = juce::jlimit (0, 127, midiNote);
+
+    noteBankCaches[(size_t) clampedBank][(size_t) lane].store (note, std::memory_order_relaxed);
+
+    if (clampedBank == activeNoteBank.load (std::memory_order_relaxed))
+        targetNoteCaches[(size_t) lane].store (note, std::memory_order_relaxed);
+}
+
+int PluginAudioProcessor::getBankNote (int bank, int lane) const
+{
+    if (lane < 0 || lane >= kNumLanes || bank < 0 || bank >= kNumNoteBanks)
+        return 0;
+
+    return noteBankCaches[(size_t) bank][(size_t) lane].load (std::memory_order_relaxed);
+}
+
+int PluginAudioProcessor::getCurrentStep (int lane) const noexcept
+{
+    if (lane < 0 || lane >= kNumLanes)
+        return -1;
+
+    return currentStepCaches[(size_t) lane].load (std::memory_order_relaxed);
 }
 
 void PluginAudioProcessor::armMIDILearn (int lane)

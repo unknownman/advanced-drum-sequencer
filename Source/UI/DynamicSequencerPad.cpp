@@ -94,6 +94,12 @@ void DynamicSequencerPad::paint (juce::Graphics& g)
     g.setFont (SequencerDesignSystem::sequenceNumberFont ());
     g.setColour (pal.text.withAlpha (active ? 0.90f : 0.65f));
     g.drawText (juce::String (stepIndex + 1), area.toNearestInt (), juce::Justification::centred);
+
+    if (processor.getCurrentStep (laneIndex) == stepIndex)
+    {
+        g.setColour (pal.accent);
+        g.fillEllipse (area.getCentreX () - 2.0f, area.getBottom () - 6.0f, 4.0f, 4.0f);
+    }
 }
 
 void DynamicSequencerPad::mouseDown (const juce::MouseEvent&)

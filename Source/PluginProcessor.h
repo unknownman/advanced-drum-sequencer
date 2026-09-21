@@ -16,6 +16,7 @@ public:
     static constexpr int kMaxStepsPerLane = 64;
     static constexpr int kAutomationStepCount = 32;
     static constexpr int kBasicChannel  = 1;
+    static constexpr int kNumNoteBanks  = 4;
 
     PluginAudioProcessor ();
 
@@ -56,6 +57,17 @@ public:
     void setSwing (float value);
     float getSwing () const;
 
+    void setVelocityScale (int lane, float value);
+    float getVelocityScale (int lane) const;
+
+    void setActiveNoteBank (int bank);
+    int getActiveNoteBank () const noexcept;
+
+    void setBankNote (int bank, int lane, int midiNote);
+    int getBankNote (int bank, int lane) const;
+
+    int getCurrentStep (int lane) const noexcept;
+
     void armMIDILearn (int lane);
     void disarmMIDILearn ();
     int getLaneInLearnMode () const noexcept;
@@ -67,6 +79,7 @@ private:
 
     void initialiseCaches ();
     void maybeProcessMIDILearn (juce::MidiBuffer&);
+    void processHardwareController (juce::MidiBuffer&);
     void scheduleLanes (juce::MidiBuffer&, int numSamples, double ppqStart, double bpm, double sampleRate);
     void stopAndFlush (juce::MidiBuffer&);
     void renderLaneHit (juce::MidiBuffer&, int lane, int globalSixteenth, int baseSample,
@@ -82,7 +95,13 @@ private:
 
     std::array<std::atomic<int>, kNumLanes> targetNoteCaches;
     std::array<std::atomic<int>, kNumLanes> loopLengthCaches;
+    std::array<std::atomic<float>, kNumLanes> velocityScaleCaches;
+    std::array<std::atomic<int>, kNumLanes> currentStepCaches;
+    std::array<std::array<std::atomic<int>, kNumLanes>, kNumNoteBanks> noteBankCaches;
     std::array<std::array<std::atomic<float>, kMaxStepsPerLane>, kNumLanes> stepVelocityCaches;
+
+    std::atomic<int> activeNoteBank { 0 };
+    std::atomic<int> mpdLaneBank    { 0 };
 
     bool timelinePrimed = false;
     bool wasPlayingLast = false;
