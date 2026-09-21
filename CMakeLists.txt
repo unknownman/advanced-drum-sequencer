@@ -37,8 +37,8 @@ juce_add_plugin (drumSeq
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     # Declared per the production-freeze spec. JUCE 8's standalone wrapper
     # derives the live automation surface from the APVTS at runtime (1233 params:
-    # 512 lane-step velocities + swing + 512 step-probabilities + 80 internal-
-    # synth ADSR/pitch + 64 Euclidean macros), so this value is host-facing
+    # 512 lane-step velocities + swing + 512 step-probabilities + 144 parametric
+    # synth ADSR/LFO/noise + 64 Euclidean macros), so this value is host-facing
     # explicitness metadata only and is not read internally.
     JUCE_AUTOMATION_PARAMETER_COUNT 1233
 )
@@ -54,9 +54,14 @@ target_link_libraries (drumSeq PRIVATE
     juce::juce_dsp
 )
 
-target_compile_definitions (drumSeq PRIVATE
+target_compile_definitions (drumSeq PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
+    # Only the VST3 plugin format is shipped (no VST2), so the VST3 wrapper may
+    # replace VST2 without a parameter-ID conflict; disables JUCE's mismatch
+    # hard-error in juce_audio_plugin_client_VST3.cpp. PUBLIC so the per-format
+    # wrapper targets (drumSeq_VST3 / drumSeq_AU) inherit the definition.
+    JUCE_VST3_CAN_REPLACE_VST2=0
 )
 
 target_compile_options (drumSeq PRIVATE -Wall -Wextra)
