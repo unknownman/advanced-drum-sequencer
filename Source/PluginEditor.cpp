@@ -12,6 +12,14 @@ const char* const kTrackNames[PluginAudioProcessor::kNumLanes] = {
     "Tom Mid",    "Tom High",   "Rim",        "Cowbell",  "Shaker",   "Claves",
     "Maracas",    "Crash",      "Ride",       "Perc"
 };
+
+const char* const kSynthParamNames[PluginAudioEditor::kSynthParamCount] = {
+    "PITCH", "ATK", "DECAY", "SUSTAIN", "RELEASE"
+};
+
+const char* const kSynthParamKeys[PluginAudioEditor::kSynthParamCount] = {
+    "pitch", "attack", "decay", "sustain", "release"
+};
 }
 
 class PluginAudioEditor::MidiLearnButton final : public juce::Button
@@ -60,14 +68,34 @@ private:
 class PluginAudioEditor::TrackHeaderRow final : public juce::Component
 {
 public:
+    class LaneSelectLabel final : public juce::Label
+    {
+    public:
+        LaneSelectLabel (PluginAudioEditor& editor, int laneIndex)
+            : owner (editor), lane (laneIndex)
+        {
+            setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        }
+
+        void mouseDown (const juce::MouseEvent&) override
+        {
+            owner.showLane (lane);
+        }
+
+    private:
+        PluginAudioEditor& owner;
+        const int lane;
+    };
+
     explicit TrackHeaderRow (PluginAudioEditor& editor, int laneIndex)
         : owner (editor),
           lane (laneIndex)
     {
-        nameLabel.setFont (SequencerDesignSystem::laneLabelFont ());
-        nameLabel.setColour (juce::Label::textColourId, SequencerDesignSystem::palette.text);
-        nameLabel.setTooltip ("Click the workspace pads to program this lane");
-        addAndMakeVisible (nameLabel);
+        nameLabel = std::make_unique<LaneSelectLabel> (editor, lane);
+        nameLabel->setFont (SequencerDesignSystem::laneLabelFont ());
+        nameLabel->setColour (juce::Label::textColourId, SequencerDesignSystem::palette.text);
+        nameLabel->setTooltip ("Click to select this lane and edit its Synth parameters");
+        addAndMakeVisible (*nameLabel);
 
         midiLearnButton = std::make_unique<MidiLearnButton> (lane);
         midiLearnButton->onClick = [this]
@@ -123,7 +151,7 @@ public:
         midiLearnButton->setBounds (learn);
         stepsSlider.setBounds (steps);
         noteLabel.setBounds (note);
-        nameLabel.setBounds (area);
+        nameLabel->setBounds (area);
     }
 
     void setSelected (bool shouldBeSelected)
@@ -131,7 +159,7 @@ public:
         const bool changed = (shouldBeSelected != selected);
         selected = shouldBeSelected;
 
-        nameLabel.setColour (juce::Label::textColourId,
+        nameLabel->setColour (juce::Label::textColourId,
                              shouldBeSelected ? SequencerDesignSystem::palette.padOn
                                               : SequencerDesignSystem::palette.text);
 
@@ -141,7 +169,7 @@ public:
 
     void setLaneName (const juce::String& name)
     {
-        nameLabel.setText (name, juce::dontSendNotification);
+        nameLabel->setText (name, juce::dontSendNotification);
     }
 
     void syncFromProcessor ()
@@ -166,7 +194,7 @@ private:
     PluginAudioEditor& owner;
     const int lane;
 
-    juce::Label nameLabel;
+    std::unique_ptr<LaneSelectLabel> nameLabel;
     juce::Label noteLabel;
     std::unique_ptr<MidiLearnButton> midiLearnButton;
     juce::Slider stepsSlider;
@@ -206,6 +234,38 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
     bankLabel.setColour (juce::Label::textColourId, SequencerDesignSystem::palette.text);
     bankLabel.setText ("BANK", juce::dontSendNotification);
     addAndMakeVisible (bankLabel);
+
+    synthPanelTitle.setFont (SequencerDesignSystem::laneLabelFont ());
+    synthPanelTitle.setColour (juce::Label::textColourId, SequencerDesignSystem::palette.padOn);
+    synthPanelTitle.setText ("SYNTH", juce::dontSendNotification);
+    addAndMakeVisible (synthPanelTitle);
+
+    const juce::NormalisableRange<float> sliderRanges[kSynthParamCount] = {
+        { -24.0f, 24.0f, 0.5f },      // pitch (semitones)
+        { 0.001f, 1.0f, 0.0005f },    // attack (s)
+        { 0.001f, 3.0f, 0.0005f },    // decay (s)
+        { 0.0f, 1.0f, 0.001f },       // sustain (0..1)
+        { 0.001f, 3.0f, 0.0005f }     // release (s)
+    };
+
+    for (int i = 0; i < kSynthParamCount; ++i)
+    {
+        synthParamLabels[(size_t) i].setFont (SequencerDesignSystem::sequenceNumberFont ());
+        synthParamLabels[(size_t) i].setColour (juce::Label::textColourId,
+                                                SequencerDesignSystem::palette.text);
+        synthParamLabels[(size_t) i].setText (kSynthParamNames[(size_t) i], juce::dontSendNotification);
+        addAndMakeVisible (synthParamLabels[(size_t) i]);
+
+        synthParamSliders[(size_t) i].setSliderStyle (juce::Slider::RotaryVerticalHorizontalDrag);
+        synthParamSliders[(size_t) i].setTextBoxStyle (juce::Slider::TextBoxBelow, false, 40, 12);
+        synthParamSliders[(size_t) i].setRange (sliderRanges[(size_t) i].start, sliderRanges[(size_t) i].end,
+                                                sliderRanges[(size_t) i].interval);
+        synthParamSliders[(size_t) i].setTooltip (juce::String (kSynthParamNames[(size_t) i])
+                                                  + " for the active lane");
+        addAndMakeVisible (synthParamSliders[(size_t) i]);
+    }
+
+    rebuildSynthPanel (0);
 
     const char* const bankNames[] = { "A", "B", "C", "D" };
 
@@ -267,8 +327,34 @@ void PluginAudioEditor::showLane (int laneIndex)
         for (int pad = 0; pad < kPadsPerLane; ++pad)
             padGrid[(size_t) lane][(size_t) pad]->setVisible (lane == selectedLane);
 
+    rebuildSynthPanel (selectedLane);
     updateTrackHeaders ();
     resized ();
+}
+
+void PluginAudioEditor::rebuildSynthPanel (int laneIndex)
+{
+    laneIndex = juce::jlimit (0, PluginAudioProcessor::kNumLanes - 1, laneIndex);
+
+    if (laneIndex == synthPanelLane)
+        return;
+
+    synthPanelLane = laneIndex;
+
+    synthPanelTitle.setText ("SYNTH L" + juce::String (synthPanelLane + 1),
+                             juce::dontSendNotification);
+
+    for (int i = 0; i < kSynthParamCount; ++i)
+    {
+        synthParamAttachments[(size_t) i].reset ();
+        synthParamAttachments[(size_t) i] =
+            std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.getAPVTS (),
+                PluginAudioProcessor::laneSynthParameterID (synthPanelLane, kSynthParamKeys[(size_t) i]),
+                synthParamSliders[(size_t) i]);
+    }
+
+    repaint ();
 }
 
 void PluginAudioEditor::updateTrackHeaders ()
@@ -307,6 +393,7 @@ void PluginAudioEditor::timerCallback ()
     updateTrackHeaders ();
     updatePlayhead ();
     refreshVisiblePads ();
+    rebuildSynthPanel (selectedLane);
 }
 
 void PluginAudioEditor::paint (juce::Graphics& g)
@@ -355,6 +442,27 @@ void PluginAudioEditor::resized ()
             bankRow.getY (),
             juce::roundToInt (bankCell),
             bankRow.getHeight ());
+    }
+
+    // Compact parametric synth panel across the bottom (active lane). The five
+    // sliders repaint/sync via the 30 Hz timer + SliderAttachments.
+    const auto synthPanel = area.removeFromBottom (92);
+
+    synthPanelTitle.setBounds (synthPanel.removeFromLeft (64).reduced (0, 34));
+
+    constexpr float synthGap  = 8.0f;
+    const float    synthCell = (synthPanel.getWidth () - synthGap * (float) (kSynthParamCount - 1))
+                               / (float) kSynthParamCount;
+
+    for (int i = 0; i < kSynthParamCount; ++i)
+    {
+        auto cell = synthPanel.removeFromLeft (juce::roundToInt (synthCell));
+
+        synthParamLabels[(size_t) i]->setBounds (cell.removeFromTop (16));
+        synthParamSliders[(size_t) i]->setBounds (cell.reduced (6, 2));
+
+        if (i < kSynthParamCount - 1)
+            synthPanel.removeFromLeft (juce::roundToInt (synthGap));
     }
 
     const auto sidebar  = area.removeFromLeft (juce::roundToInt (area.getWidth () * 0.25f)).reduced (0, 4);

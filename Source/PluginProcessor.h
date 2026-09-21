@@ -38,13 +38,40 @@ public:
 
     static constexpr int kDrumVoiceCount = 16;
 
+    // Per-lane parametric synth parameters, surfaced as pre-cached atomic
+    // pointers (apvts.getRawParameterValue) so the audio thread never performs
+    // string lookups. Stored values are normalized 0..1; the range is kept in
+    // the channel struct for instant convertFrom0to1 on the audio thread.
+    struct SynthParamChannel
+    {
+        std::atomic<float>* pitch   = nullptr;
+        std::atomic<float>* attack  = nullptr;
+        std::atomic<float>* decay   = nullptr;
+        std::atomic<float>* sustain = nullptr;
+        std::atomic<float>* release = nullptr;
+
+        juce::NormalisableRange<float> pitchRange   { -24.0f, 24.0f, 0.5f };
+        juce::NormalisableRange<float> attackRange  { 0.001f, 1.0f,  0.0005f };
+        juce::NormalisableRange<float> decayRange   { 0.001f, 3.0f,  0.0005f };
+        juce::NormalisableRange<float> sustainRange { 0.0f,   1.0f,  0.001f };
+        juce::NormalisableRange<float> releaseRange { 0.001f, 3.0f,  0.0005f };
+    };
+
     struct DrumVoice
     {
         DrumModel model = DrumModel::kick;
         bool active = false;
         int samplesLeft = 0;
+        int noteOffCountdown = 0;
+        bool noteOffSent = false;
 
-        double env = 0.0;
+        float outputGain = 1.0f;      // captured MIDI velocity 0..1
+
+        // Fully polyphonic ADSR state, driven lock-free by per-lane atomics.
+        juce::ADSR adsr;
+        juce::ADSR::Parameters adsrParams { 0.001f, 0.25f, 0.0f, 0.1f };
+
+        double pitchScale = 1.0;      // 2^(semitones / 12)
 
         // Kick: sine-phase oscillator with exponential pitch sweep.
         double kickPhase    = 0.0;
@@ -55,7 +82,6 @@ public:
         double bandX1 = 0.0, bandX2 = 0.0;
         double bandY1 = 0.0, bandY2 = 0.0;
         double tonePhase = 0.0;
-        double toneAmp   = 0.0;
 
         // Hi-Hat: high-passed noise state.
         double hpLastX = 0.0;
@@ -93,6 +119,7 @@ public:
     juce::AudioProcessorValueTreeState& getAPVTS () noexcept { return apvts; }
 
     static juce::String laneStepVelParameterID (int lane, int step);
+    static juce::String laneSynthParameterID (int lane, const char* paramName);
     juce::RangedAudioParameter* getLaneStepVelParameter (int lane, int step);
 
     void setStepVelocity (int lane, int step, float value);
@@ -139,10 +166,11 @@ private:
 
     // Standalone-only internal synthesizer (pre-allocated; never entered in DAW).
     void initialiseDrumSynth (double sampleRate);
-    void renderInternalSynth (juce::AudioBuffer<float>&, juce::MidiBuffer&, int numSamples);
+    void renderInternalSynth (juce::AudioBuffer<float>&, int numSamples);
     void renderDrumVoice (juce::AudioBuffer<float>&, DrumVoice&, int numSamples);
-    void triggerDrumVoice (int note, float velocity01);
-    static DrumModel drumModelForNote (int note);
+    void triggerDrumVoice (int lane, float velocity01);
+    void noteOffDrumVoices ();
+    static DrumModel drumModelForLane (int lane);
     static std::uint32_t nextXorshift (std::uint32_t& state);
 
     static int positiveMod (int value, int modulo);
@@ -169,17 +197,15 @@ private:
     // Pre-allocated drum-synthesis voice pool. Round-robin voice-stealing;
     // zero heap growth and zero disk I/O after prepareToPlay().
     std::array<DrumVoice, kDrumVoiceCount> drumVoices;
+    std::array<SynthParamChannel, kNumLanes> synthParamChannels;
     int drumVoiceRoll     = 0;
     std::uint32_t voiceSeedCounter = 1;
+    bool synthArmed = false;
 
     // Fixed structural synthesis tuning (computed once in prepareToPlay()).
     double kickPitchStep      = 1.0;   // exponential-pitch sweep multiplier
-    double kickAmpStep        = 1.0;   // kick amplitude decay multiplier
-    double snareNoiseAmpStep  = 1.0;
-    double snareToneAmpStep   = 1.0;
     double snareTonePhaseInc  = 0.0;
     double snareBP[5]         = {};    // normalized biquad band-pass (b0 b1 b2 a1 a2)
-    double hiHatAmpStep       = 1.0;
     double hiHatHPGain        = 0.0;   // first-order high-pass feedback gain
 
     // Continuous virtual playhead for Standalone (no host timeline): this

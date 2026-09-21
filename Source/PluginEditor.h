@@ -19,6 +19,7 @@ public:
     static constexpr int kStepsAcross = 8;
     static constexpr int kStepsDown   = 4;
     static constexpr int kPadsPerLane = kStepsAcross * kStepsDown;
+    static constexpr int kSynthParamCount = 5;
 
     explicit PluginAudioEditor (PluginAudioProcessor&);
     ~PluginAudioEditor () override;
@@ -35,6 +36,7 @@ private:
     void updateTrackHeaders ();
     void updatePlayhead ();
     void refreshVisiblePads ();
+    void rebuildSynthPanel (int laneIndex);
 
     PluginAudioProcessor& processor;
     SequencerDesignSystem lookAndFeel;
@@ -52,6 +54,15 @@ private:
 
     std::array<std::array<std::unique_ptr<DynamicSequencerPad>, kPadsPerLane>,
                PluginAudioProcessor::kNumLanes> padGrid;
+
+    // Parametric synth controls for the active lane. Attachments are rebuilt
+    // when the selected lane changes; the 30 Hz timer keeps them in sync.
+    juce::Label synthPanelTitle;
+    std::array<juce::Label, kSynthParamCount> synthParamLabels;
+    std::array<juce::Slider, kSynthParamCount> synthParamSliders;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>,
+               kSynthParamCount> synthParamAttachments;
+    int synthPanelLane = -1;
 
     int selectedLane     = 0;
     int lastPlayheadStep = -2;

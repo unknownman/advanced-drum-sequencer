@@ -12,27 +12,31 @@ namespace
 constexpr double kTwoPi = 6.28318530717958647692;
 
 // Structural tuning for the pre-allocated standalone drum models. Everything
-// here is fixed at compile time so prepareToPlay() only computes per-sample
-// constants (no heap, no disk, no look-up tables).
+// here is fixed at compile time; the envelope (attack/decay/sustain/release)
+// and pitch are live lane parameters read from pre-cached atomics.
 struct DrumSynthTuning
 {
-    double tailThreshold   = 1e-4;
-
     double kickBaseFreq    = 50.0;    // Hz floor of the pitch sweep
     double kickPitchExc    = 100.0;   // 150 Hz start - 50 Hz floor
-    double kickLife        = 0.300;   // seconds of amplitude tail
     double kickPitchTime   = 0.080;   // seconds to complete the drop
 
-    double snareNoiseLife  = 0.180;
-    double snareToneLife   = 0.120;
     double snareToneFreq   = 180.0;
     double snareBPFreq     = 1100.0;  // band-pass center for the noise body
     double snareBPQ        = 1.0;
 
-    double hiHatLife       = 0.045;   // very fast amplitude decay
     double hiHatHPFreq     = 7500.0;  // high-pass corner for "metallic" top
+    double hiHatNoisePole  = 0.5;     // noise-body balance toward the tone
+
+    // Sanity clamps applied when the live ADSR atomics are ingested, so an
+    // in-flight automation write can never produce a degenerate envelope.
+    double minAttackS      = 0.0001;
+    double minDecayS       = 0.0001;
+    double minReleaseS     = 0.0001;
+    double maxEnvelopeS    = 3.25;    // tail cap: attack + decay + release + margin
 };
 constexpr DrumSynthTuning kSynth {};
+
+constexpr double kVoiceTailSafetySeconds = 0.05;
 }
 
 PluginAudioProcessor::PluginAudioProcessor ()
@@ -81,7 +85,70 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginAudioProcessor::create
                 0.0f));
         }
 
+    // Parametric internal-synth engine: 5 automatable configuration params per
+    // lane (Pitch + ADSR). Being declared directly on the APVTS layout tree,
+    // they inherit the XML state serialization layer for free, so presets and
+    // Ableton project saves round-trip the full synthesis setup.
+    for (int lane = 0; lane < kNumLanes; ++lane)
+    {
+        const auto pitchRange = juce::NormalisableRange<float> (-24.0f, 24.0f, 0.5f)
+                                    .withStringFromValueFunction ([] (float v)
+                                                                  {
+                                                                      return juce::String::formatted ("%+d st", juce::roundToInt (v));
+                                                                  });
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "pitch"),
+            "Lane " + juce::String (lane + 1) + " Synth Pitch",
+            pitchRange,
+            0.0f));
+
+        const auto timeRange = [] (float hi)
+        {
+            return juce::NormalisableRange<float> (0.001f, hi, 0.0005f)
+                .withStringFromValueFunction ([] (float v)
+                                              {
+                                                  if (v >= 0.995f)
+                                                      return juce::String::formatted ("%.2f s", v);
+                                                  return juce::String::formatted ("%.1f ms", v * 1000.0f);
+                                              });
+        };
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "attack"),
+            "Lane " + juce::String (lane + 1) + " Synth Attack",
+            timeRange (1.0f),
+            0.001f));
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "decay"),
+            "Lane " + juce::String (lane + 1) + " Synth Decay",
+            timeRange (3.0f),
+            0.25f));
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "sustain"),
+            "Lane " + juce::String (lane + 1) + " Synth Sustain",
+            juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f)
+                .withStringFromValueFunction ([] (float v)
+                                              {
+                                                  return juce::String (juce::roundToInt (v * 100.0f)) + "%";
+                                              }),
+            0.0f));
+
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            laneSynthParameterID (lane, "release"),
+            "Lane " + juce::String (lane + 1) + " Synth Release",
+            timeRange (3.0f),
+            0.1f));
+    }
+
     return layout;
+}
+
+juce::String PluginAudioProcessor::laneSynthParameterID (int lane, const char* paramName)
+{
+    return juce::String::formatted ("lane_%d_synth_%s", lane, paramName);
 }
 
 juce::String PluginAudioProcessor::laneStepVelParameterID (int lane, int step)
@@ -160,15 +227,24 @@ void PluginAudioProcessor::initialiseDrumSynth (double sampleRate)
     if (sampleRate <= 0.0)
         sampleRate = 48000.0;
 
-    // Exponential-decay multipliers: each model's amplitude envelope reaches
-    // tailThreshold over its configured life span.
-    kickPitchStep       = std::pow (0.0015, 1.0 / (kSynth.kickPitchTime * sampleRate));
-    kickAmpStep         = std::pow (kSynth.tailThreshold, 1.0 / (kSynth.kickLife * sampleRate));
-    snareNoiseAmpStep   = std::pow (kSynth.tailThreshold, 1.0 / (kSynth.snareNoiseLife * sampleRate));
-    snareToneAmpStep    = std::pow (kSynth.tailThreshold, 1.0 / (kSynth.snareToneLife * sampleRate));
-    snareTonePhaseInc   = kTwoPi * kSynth.snareToneFreq / sampleRate;
+    // Cache the live ADSR / pitch atomics once. apvts.getRawParameterValue
+    // returns stable pointers owned by the tree; the UI/automation thread
+    // updates them and the audio thread only ever load()s them.
+    for (int lane = 0; lane < kNumLanes; ++lane)
+    {
+        auto& channel = synthParamChannels[(size_t) lane];
 
-    // RBJ cookbook band-pass biquad (a0 normalized), Direct Form 1.
+        channel.pitch   = apvts.getRawParameterValue (laneSynthParameterID (lane, "pitch"));
+        channel.attack  = apvts.getRawParameterValue (laneSynthParameterID (lane, "attack"));
+        channel.decay   = apvts.getRawParameterValue (laneSynthParameterID (lane, "decay"));
+        channel.sustain = apvts.getRawParameterValue (laneSynthParameterID (lane, "sustain"));
+        channel.release = apvts.getRawParameterValue (laneSynthParameterID (lane, "release"));
+    }
+
+    // Exponential pitch-sweep multiplier for the kick model.
+    kickPitchStep = std::pow (0.0015, 1.0 / (kSynth.kickPitchTime * sampleRate));
+
+    // Snare: RBJ cookbook band-pass biquad (a0 normalized), Direct Form 1.
     const double w     = kTwoPi * kSynth.snareBPFreq / sampleRate;
     const double alpha = std::sin (w) / (2.0 * kSynth.snareBPQ);
     const double a0    = 1.0 + alpha;
@@ -180,16 +256,22 @@ void PluginAudioProcessor::initialiseDrumSynth (double sampleRate)
     snareBP[3] = a1 / a0;
     snareBP[4] = a2 / a0;
 
-    hiHatAmpStep = std::pow (kSynth.tailThreshold, 1.0 / (kSynth.hiHatLife * sampleRate));
-    hiHatHPGain  = 1.0 - std::exp (-kTwoPi * kSynth.hiHatHPFreq / sampleRate);
+    snareTonePhaseInc = kTwoPi * kSynth.snareToneFreq / sampleRate;
 
-    // Reset the fixed voice pool and the virtual playhead counter.
+    // First-order high-pass coefficient for the hi-hat model.
+    hiHatHPGain = 1.0 - std::exp (-kTwoPi * kSynth.hiHatHPFreq / sampleRate);
+
+    // Reset the fixed voice pool, the virtual playhead counter, and seed every
+    // pre-allocated juce::ADSR with the current sample rate.
     internalPpqPosition = 0.0;
     drumVoiceRoll       = 0;
     voiceSeedCounter    = 1;
 
     for (auto& voice : drumVoices)
+    {
         voice = DrumVoice {};
+        voice.adsr.setSampleRate (sampleRate);
+    }
 }
 
 void PluginAudioProcessor::releaseResources ()
@@ -211,6 +293,8 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     // machine in a DAW (VST3/AU). In Standalone there is no external machine,
     // so the same note-on stream is tapped to render internal audio instead.
     const bool standalone = (wrapperType == juce::AudioProcessor::wrapperType_Standalone);
+
+    synthArmed = standalone;
 
     const int numSamples = buffer.getNumSamples ();
 
@@ -260,7 +344,7 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     }
 
     if (standalone)
-        renderInternalSynth (buffer, midiMessages, numSamples);
+        renderInternalSynth (buffer, numSamples);
 
     wasPlayingLast = isPlaying;
 }
@@ -525,6 +609,11 @@ void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int la
     midiMessages.addEvent (juce::MidiMessage::noteOn (kBasicChannel, midiNote, (juce::uint8) velocityMidi),
                            samplePos);
 
+    // Standalone: converge the scheduler hit directly into the pre-allocated
+    // parametric voice engine (envelope.noteOn with the lane's cached ADSR).
+    if (synthArmed)
+        triggerDrumVoice (lane, juce::jlimit (0.0f, 1.0f, velocity01 * scale));
+
     const std::int64_t noteOffSamples = (std::int64_t) std::lround (currentSampleRate * 0.08);
     const std::int64_t noteOffSlot    = (std::int64_t) samplePos + noteOffSamples;
 
@@ -553,6 +642,8 @@ void PluginAudioProcessor::stopAndFlush (juce::MidiBuffer& midiMessages)
             slot.active = false;
 
         noteOffCount = 0;
+
+        noteOffDrumVoices ();
     }
 
     timelinePrimed = false;
@@ -566,25 +657,24 @@ int PluginAudioProcessor::positiveMod (int value, int modulo)
 }
 
 // ---------------------------------------------------------------------------
-// Internal pre-allocated drum synthesizer (Standalone only).
+// Internal pre-allocated parametric drum synthesizer (Standalone only).
 //
-// Task A: kick (sine with fast exponential pitch sweep 150 -> 50 Hz over
-// ~80 ms), snare (band-passed white noise + a short 180 Hz sine tone), hihat
-// (high-passed white noise with a fast ~45 ms exponential decay). Voices are
-// pre-allocated in prepareToPlay() and the processBlock path never touches the
-// heap or the disk.
+// Lane row topology is fixed by the 16-pad drum map:
+//   Lanes 0, 4, 8, 12        (row A) -> low-freq kick: sine + exp pitch sweep
+//   Lanes 1, 5, 9, 13        (row B) -> mid-freq snare: band-passed noise + tone
+//   Lanes 2, 3, 6, 7, 10,
+//   11, 14, 15               (rows C/D) -> metallic hi-hat/percussion
+// Each hit reads the lane's live pitch + ADSR atomics and runs a dedicated
+// pre-allocated juce::ADSR voice. No heap, no strings, no allocations.
 // ---------------------------------------------------------------------------
 
-PluginAudioProcessor::DrumModel PluginAudioProcessor::drumModelForNote (int note)
+PluginAudioProcessor::DrumModel PluginAudioProcessor::drumModelForLane (int lane)
 {
-    // Default NOTEMAP pattern (36..51, repeated across the 4 note banks): lane
-    // 0 is the kick, lane 1 the snare, lanes 2 and 3 the hi-hat.
-    switch (positiveMod (note - 36, kNumLanes))
+    switch (positiveMod (lane, 4))
     {
+        case 0:  return DrumModel::kick;
         case 1:  return DrumModel::snare;
-        case 2:
-        case 3:  return DrumModel::hihat;
-        default: return DrumModel::kick;
+        default: return DrumModel::hihat;
     }
 }
 
@@ -596,9 +686,31 @@ std::uint32_t PluginAudioProcessor::nextXorshift (std::uint32_t& state)
     return state;
 }
 
-void PluginAudioProcessor::triggerDrumVoice (int note, float velocity01)
+void PluginAudioProcessor::triggerDrumVoice (int lane, float velocity01)
 {
-    const DrumModel model = drumModelForNote (note);
+    if (lane < 0 || lane >= kNumLanes)
+        return;
+
+    const auto& channel = synthParamChannels[(size_t) lane];
+
+    // Lock-free reads: these atomics are updated by the APVTS on the UI /
+    // automation thread; the audio thread only ever loads them. The pointers
+    // are cached in prepareToPlay() but guarded here for full safety.
+    const auto loadOr = [] (std::atomic<float>* ptr, float fallback)
+    {
+        return ptr != nullptr ? ptr->load (std::memory_order_relaxed) : fallback;
+    };
+
+    // Fallbacks are normalized values that convert to the layout defaults.
+    const float attack   = juce::jmax (channel.attackRange.convertFrom0to1 (juce::jlimit (0.0f, 1.0f, loadOr (channel.attack, 0.0f))),
+                                       (float) kSynth.minAttackS);
+    const float decay    = juce::jmax (channel.decayRange.convertFrom0to1 (juce::jlimit (0.0f, 1.0f, loadOr (channel.decay, 0.083f))),
+                                       (float) kSynth.minDecayS);
+    const float sustain  = juce::jlimit (0.0f, 1.0f, loadOr (channel.sustain, 0.0f));
+    const float release  = juce::jmax (channel.releaseRange.convertFrom0to1 (juce::jlimit (0.0f, 1.0f, loadOr (channel.release, 0.033f))),
+                                       (float) kSynth.minReleaseS);
+    const float pitchSemitones = channel.pitchRange.convertFrom0to1 (
+        juce::jlimit (0.0f, 1.0f, loadOr (channel.pitch, 0.5f)));
 
     // Round-robin steal: the voice under drumVoiceRoll is always reclaimed,
     // whether its envelope already died or it is being cut off.
@@ -606,69 +718,74 @@ void PluginAudioProcessor::triggerDrumVoice (int note, float velocity01)
     drumVoiceRoll    = (drumVoiceRoll + 1) % kDrumVoiceCount;
 
     voice = DrumVoice {};
-    voice.model       = model;
+    voice.model       = drumModelForLane (lane);
     voice.active      = true;
-    voice.env         = juce::jlimit (0.0, 1.0, (double) velocity01);
+    voice.outputGain  = juce::jlimit (0.0f, 1.0f, velocity01);
+    voice.pitchScale  = std::pow (2.0, pitchSemitones / 12.0);
 
-    voice.noiseState  = (voiceSeedCounter += 0x6D2B79F5u) | 1u;
-    ++voiceSeedCounter;
+    voice.adsr.setSampleRate (currentSampleRate);
+    voice.adsrParams.attack  = attack;
+    voice.adsrParams.decay   = decay;
+    voice.adsrParams.sustain = sustain;
+    voice.adsrParams.release = release;
 
-    switch (model)
+    // Percussive hits are staccato: after attack + decay the initial transient
+    // is spent, so force the release stage (envelope tail) shortly afterwards.
+    // The cap guarantees the fixed pool always reclaims the voice.
+    voice.noteOffCountdown = (int) ((attack + decay) * currentSampleRate);
+    voice.samplesLeft      = (int) ((kSynth.maxEnvelopeS + kVoiceTailSafetySeconds) * currentSampleRate);
+
+    voice.adsr.setParameters (voice.adsrParams);
+    voice.adsr.noteOn ();
+
+    voice.noiseState = (voiceSeedCounter += 0x6D2B79F5u) | 1u;
+
+    switch (voice.model)
     {
         case DrumModel::kick:
-            voice.samplesLeft    = (int) (kSynth.kickLife * currentSampleRate);
             voice.kickPhase      = 0.0;
+            voice.kickPitchExc   = 1.0;   // full sweep excursion (150 -> 50 Hz)
             break;
 
         case DrumModel::snare:
-            voice.samplesLeft    = (int) (kSynth.snareNoiseLife * currentSampleRate);
             voice.bandX1         = 0.0;
             voice.bandX2         = 0.0;
             voice.bandY1         = 0.0;
             voice.bandY2         = 0.0;
             voice.tonePhase      = 0.0;
-            voice.toneAmp        = voice.env;
             break;
 
         case DrumModel::hihat:
-            voice.samplesLeft = (int) (kSynth.hiHatLife * currentSampleRate);
-            voice.hpLastX     = 0.0;
-            voice.hpLastY     = 0.0;
+            voice.hpLastX        = 0.0;
+            voice.hpLastY        = 0.0;
             break;
     }
 }
 
-void PluginAudioProcessor::renderInternalSynth (juce::AudioBuffer<float>& buffer,
-                                                juce::MidiBuffer& midiMessages,
-                                                int numSamples)
+void PluginAudioProcessor::noteOffDrumVoices ()
+{
+    for (auto& voice : drumVoices)
+        if (voice.active)
+            voice.adsr.noteOff ();
+}
+
+void PluginAudioProcessor::renderInternalSynth (juce::AudioBuffer<float>& buffer, int numSamples)
 {
     if (numSamples <= 0)
         return;
 
-    for (const auto& metadata : midiMessages)
-    {
-        if (metadata.numBytes < 3)
-            continue;
-
-        const auto* data = metadata.data;
-
-        if ((data[0] & 0xF0) != 0x90)                  // note-on family only
-            continue;
-
-        if ((data[0] & 0x0F) != (kBasicChannel - 1))   // MIDI channel 1 only
-            continue;
-
-        const int velocity = data[2];
-
-        if (velocity <= 0)                             // note-offs are ignored
-            continue;                                  // (voices decay naturally)
-
-        triggerDrumVoice (data[1], velocity / 127.0f);
-    }
-
     for (auto& voice : drumVoices)
         if (voice.active)
             renderDrumVoice (buffer, voice, numSamples);
+
+    // Sum of up to 16 voices must remain within a safe output range.
+    for (int c = 0; c < buffer.getNumChannels (); ++c)
+    {
+        auto* channel = buffer.getWritePointer (c);
+
+        for (int s = 0; s < numSamples; ++s)
+            channel[s] = juce::jlimit (-1.0f, 1.0f, channel[s]);
+    }
 }
 
 void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
@@ -678,26 +795,49 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
     const int numChannels = juce::jmax (1, buffer.getNumChannels ());
     const float* const* channels = buffer.getArrayOfWritePointers ();
 
-    for (int s = 0; s < numSamples && s < voice.samplesLeft; ++s)
+    const double invSampleRate = 1.0 / currentSampleRate;
+
+    for (int s = 0; s < numSamples && voice.active; ++s)
     {
+        if (voice.noteOffCountdown > 0)
+            --voice.noteOffCountdown;
+
+        if (voice.noteOffCountdown == 0 && ! voice.noteOffSent)
+        {
+            voice.noteOffSent = true;
+            voice.adsr.noteOff ();
+        }
+
+        const double env = voice.adsr.getNextSample ();
+
+        if (env <= 0.0 && ! voice.adsr.isActive ())
+        {
+            voice.active = false;
+            break;
+        }
+
+        if (voice.samplesLeft <= 0)
+        {
+            voice.active = false;
+            break;
+        }
+
+        --voice.samplesLeft;
+
         double output = 0.0;
 
         switch (voice.model)
         {
             case DrumModel::kick:
             {
-                // 150 Hz wide-open -> closes on 50 Hz; env polynomial adds the
-                // familiar punch so the sweep is audible over the tail.
-                const double freq = kSynth.kickBaseFreq + kSynth.kickPitchExc * voice.kickPitchExc;
-                voice.kickPhase += kTwoPi * freq / currentSampleRate;
-                const double phase = std::fmod (voice.kickPhase, kTwoPi);
-
-                const double v = (1.0 - voice.env) * (1.0 - voice.env);
-                output = (std::sin (phase) * (1.0 - v) + (phase < kTwoPi * 0.15 ? 1.0 : 0.0) * v)
-                         * voice.env;
-
+                // Sine oscillator, exponential pitch sweep 150 -> 50 Hz, scaled
+                // live by the lane's Synth Pitch parameter.
+                const double freq = (kSynth.kickBaseFreq + kSynth.kickPitchExc * voice.kickPitchExc)
+                                    * voice.pitchScale;
+                voice.kickPhase += kTwoPi * freq * invSampleRate;
                 voice.kickPitchExc *= kickPitchStep;
-                voice.env         *= kickAmpStep;
+
+                output = std::sin (voice.kickPhase) * env;
                 break;
             }
 
@@ -706,22 +846,21 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
                 const double noise = nextXorshift (voice.noiseState) * (1.0 / 4294967295.0) * 2.0 - 1.0;
 
                 // Direct Form 1 band-pass biquad over the white noise.
+                const double prevY1 = voice.bandY1;
+                const double prevY2 = voice.bandY2;
+
                 voice.bandY1 = snareBP[0] * noise
                              + snareBP[1] * voice.bandX1 + snareBP[2] * voice.bandX2
-                             - snareBP[3] * voice.bandY1 - snareBP[4] * voice.bandY2;
+                             - snareBP[3] * prevY1 - snareBP[4] * prevY2;
+                voice.bandY2 = prevY1;
                 voice.bandX2 = voice.bandX1;
                 voice.bandX1 = noise;
 
                 const double bandPassed = voice.bandY1;
-                const double tone       = std::sin (voice.tonePhase) * voice.toneAmp;
+                const double tone = std::sin (voice.tonePhase);
+                voice.tonePhase += snareTonePhaseInc * voice.pitchScale;
 
-                voice.bandY2 = voice.bandY1;
-                voice.tonePhase += snareTonePhaseInc;
-
-                output = bandPassed * (1.0 - voice.env * 0.25) + tone * (voice.env * voice.env);
-
-                voice.env             *= snareNoiseAmpStep;
-                voice.toneAmp         *= snareToneAmpStep;
+                output = bandPassed * (0.55 + 0.45 * env) + tone * (env * env);
                 break;
             }
 
@@ -732,24 +871,22 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
                 // First-order high-pass: y = g * (x - x1 + y1).
                 const double hp = hiHatHPGain * ((noise - voice.hpLastX) + voice.hpLastY);
 
-                output = hp * voice.env;
+                output = hp * env * (1.0 - kSynth.hiHatNoisePole);
 
                 voice.hpLastX = noise;
                 voice.hpLastY = hp;
-                voice.env    *= hiHatAmpStep;
                 break;
             }
         }
 
+        output *= voice.outputGain;
         output = juce::jlimit (-1.0, 1.0, output);
 
         for (int c = 0; c < numChannels; ++c)
-            channels[c][s] = (float) output;
-
-        --voice.samplesLeft;
+            channels[c][s] += (float) output;   // accumulate: 16 voices share the bus
     }
 
-    if (voice.samplesLeft <= 0 || voice.env < kSynth.tailThreshold)
+    if (voice.samplesLeft <= 0 || ! voice.adsr.isActive ())
         voice.active = false;
 }
 
