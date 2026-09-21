@@ -145,6 +145,9 @@ ensure_juce () {
 configure () {
     log "Step 2/7: configuring Xcode generator, universal matrix $ARCHS"
 
+    # Clean execution freeze: flush every prior CMake cache/generated-product
+    # layer for the freeze build so no stale object or stale JUCE channel-bus
+    # setting can leak into the archived universal binary.
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
 

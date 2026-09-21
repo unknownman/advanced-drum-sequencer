@@ -34,7 +34,12 @@ juce_add_plugin (drumSeq
     IS_MIDI_EFFECT           FALSE
     NEEDS_MIDI_INPUT         TRUE
     NEEDS_MIDI_OUTPUT        TRUE
-    EDITOR_NEEDS_KEYBOARD_FOCUS TRUE
+    EDITOR_WANTS_KEYBOARD_FOCUS TRUE
+    # Declared per the production-freeze spec. JUCE 8's standalone wrapper
+    # derives the live automation surface from the APVTS at runtime (593 params:
+    # 512 lane-step velocities + swing + 80 internal-synth ADSR/pitch), so this
+    # value is host-facing explicitness metadata only and is not read internally.
+    JUCE_AUTOMATION_PARAMETER_COUNT 513
 )
 
 target_link_libraries (drumSeq PRIVATE

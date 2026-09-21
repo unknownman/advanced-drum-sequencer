@@ -176,6 +176,18 @@ void PluginAudioProcessor::initialiseCaches ()
     for (int lane = 0; lane < kNumLanes; ++lane)
         lastSteps[lane] = -1;
 
+    // Lock-free pre-initialization: the 16-DrumVoice pool must be fully reset
+    // to inactive states during object creation, before any CoreAudio device
+    // preference exists at boot. The std::array value-init already yields
+    // inactive defaults, but this explicit reset makes the invariant
+    // self-documenting and order-independent of prepareToPlay().
+    for (auto& voice : drumVoices)
+        voice = DrumVoice {};
+
+    drumVoiceRoll    = 0;
+    voiceSeedCounter = 1;
+    synthArmed       = false;
+
     timelinePrimed     = false;
     wasPlayingLast     = false;
     lastSixteenthFired = 0;
@@ -214,6 +226,13 @@ void PluginAudioProcessor::resetPatternData ()
 
 void PluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    // Defensive math design: the hardware driver's rate is uninitialized at
+    // construction, so never trust it blindly here. If the device reports a
+    // degenerate sample rate, force a safe fallback so no filter coefficient
+    // or clock step metric is ever computed from a zero divisor.
+    if (! (sampleRate > 0.0))
+        sampleRate = 48000.0;
+
     currentSampleRate    = sampleRate;
     noteOffQueue.fill ({});
 
@@ -221,6 +240,9 @@ void PluginAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     // dense note queues never allocate on the audio thread.
     scratchBuffer.ensureSize (8192u);
 
+    // All DSP architecture scaling (kick pitch-sweep multiplier, snare biquad,
+    // hi-hat high-pass gain) is compiled strictly inside the safe perimeter of
+    // prepareToPlay, using the validated sample rate above.
     initialiseDrumSynth (sampleRate);
 
     if (auto* swing = apvts.getParameter ("swing"))
@@ -327,6 +349,14 @@ void PluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
 
     currentSampleRate = sampleRate;
     fallbackBpmCache.store (bpm, std::memory_order_relaxed);
+
+    // Pure memory sanity fence: degenerate temporal metrics (an uninitialized
+    // driver rate or a host bpm of 0) must never reach the PPQ integrator or
+    // the oscillator/scalar DSP below. The block was already cleared above, so
+    // an early return ships a guaranteed-silent frame to the CoreAudio driver
+    // instead of NaN/Inf float garbage.
+    if (currentSampleRate <= 0.0 || bpm <= 0.0)
+        return;
 
     // Standalone has no transport timeline, so the sequencer must run forever
     // on its own sample-driven virtual playhead at fallbackBpmCache tempo.
@@ -589,6 +619,12 @@ void PluginAudioProcessor::renderLaneHit (juce::MidiBuffer& midiMessages, int la
                                           int absoluteSixteenth, int baseSample,
                                           double samplesPerStep, int numSamples)
 {
+    // Guard the stateless scheduler against uninitialized temporal metrics:
+    // a degenerate step window or an unvalidated sample rate must never reach
+    // the swing/note-off scalings below.
+    if (currentSampleRate <= 0.0 || samplesPerStep <= 0.0)
+        return;
+
     // Deduplicate per *absolute* 16th, not per loop step: a live loop-length
     // edit or a Loop Length of 1 re-fires on every boundary without skipping.
     if (absoluteSixteenth == lastSteps[lane])
@@ -817,12 +853,28 @@ void PluginAudioProcessor::renderDrumVoice (juce::AudioBuffer<float>& buffer,
                                             int numSamples,
                                             int hwChannels)
 {
-    const int numChannels = juce::jlimit (1, hwChannels, buffer.getNumChannels ());
+    // Runtime safety fence: never write through a degenerate sample rate (the
+    // inverse would be a division by zero) and bound every inner write loop by
+    // BOTH the requested sample window and the physical channels the driver
+    // actually exposes (hwChannels is already clamped at the call site).
+    if (currentSampleRate <= 0.0)
+        return;
+
+    const int safeSamples = juce::jmin (numSamples, buffer.getNumSamples ());
+
+    if (safeSamples <= 0 || hwChannels <= 0)
+        return;
+
+    const int numChannels = juce::jmin (hwChannels, buffer.getNumChannels ());
+
+    if (numChannels <= 0)
+        return;
+
     float* const* channels = buffer.getArrayOfWritePointers ();
 
     const double invSampleRate = 1.0 / currentSampleRate;
 
-    for (int s = 0; s < numSamples && voice.active; ++s)
+    for (int s = 0; s < safeSamples && voice.active; ++s)
     {
         if (voice.noteOffCountdown > 0)
             --voice.noteOffCountdown;

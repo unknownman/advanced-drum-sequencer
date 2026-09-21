@@ -307,6 +307,10 @@ PluginAudioEditor::PluginAudioEditor (PluginAudioProcessor& p)
             padGrid[(size_t) lane][(size_t) pad] = std::move (sequencerPad);
         }
 
+    // Child pools are fully allocated: resized() may now dereference them.
+    // showLane(0) below performs an explicit layout pass against the real size.
+    uiInitialized = true;
+
     showLane (0);
 
     startTimerHz (30);
@@ -414,6 +418,14 @@ void PluginAudioEditor::paint (juce::Graphics& g)
 
 void PluginAudioEditor::resized ()
 {
+    // Standalone launch-crash guard: setResizeLimits()/setSize() inside the
+    // constructor dispatch synchronous resized() calls while the
+    // bankButtons/trackHeaders/padGrid pools are still empty (all unique_ptr
+    // children null). Dereferencing them would fault at (this == 0) - the
+    // immediate-launch SIGSEGV previously observed at Component::setBounds +0x40.
+    if (! uiInitialized)
+        return;
+
     auto area = getLocalBounds ().reduced (10, 8);
 
     auto header = area.removeFromTop (56);

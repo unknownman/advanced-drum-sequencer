@@ -68,6 +68,12 @@ private:
     int lastPlayheadStep = -2;
     int sidebarDividerX  = 0;
 
+    // Set once the bankButtons/trackHeaders/padGrid child pools are fully
+    // allocated. setResizeLimits()/setSize() inside the constructor dispatch a
+    // synchronous resized() before those pools exist, so resized() must not
+    // dereference them until this is true.
+    bool uiInitialized = false;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginAudioEditor)
 };
 
