@@ -28,6 +28,40 @@ public:
         bool active = false;
     };
 
+    // Internal synthesizer voice models (Standalone verify path only).
+    enum class DrumModel
+    {
+        kick,
+        snare,
+        hihat
+    };
+
+    static constexpr int kDrumVoiceCount = 16;
+
+    struct DrumVoice
+    {
+        DrumModel model = DrumModel::kick;
+        bool active = false;
+        int samplesLeft = 0;
+
+        double env = 0.0;
+
+        // Kick: sine-phase oscillator with exponential pitch sweep.
+        double kickPhase    = 0.0;
+        double kickPitchExc = 0.0;
+
+        // Snare: band-passed white noise + 180 Hz tone.
+        std::uint32_t noiseState = 0x9E3779B1u;
+        double bandX1 = 0.0, bandX2 = 0.0;
+        double bandY1 = 0.0, bandY2 = 0.0;
+        double tonePhase = 0.0;
+        double toneAmp   = 0.0;
+
+        // Hi-Hat: high-passed noise state.
+        double hpLastX = 0.0;
+        double hpLastY = 0.0;
+    };
+
     PluginAudioProcessor ();
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -103,6 +137,14 @@ private:
     void renderLaneHit (juce::MidiBuffer&, int lane, int absoluteSixteenth, int baseSample,
                         double samplesPerStep, int numSamples);
 
+    // Standalone-only internal synthesizer (pre-allocated; never entered in DAW).
+    void initialiseDrumSynth (double sampleRate);
+    void renderInternalSynth (juce::AudioBuffer<float>&, juce::MidiBuffer&, int numSamples);
+    void renderDrumVoice (juce::AudioBuffer<float>&, DrumVoice&, int numSamples);
+    void triggerDrumVoice (int note, float velocity01);
+    static DrumModel drumModelForNote (int note);
+    static std::uint32_t nextXorshift (std::uint32_t& state);
+
     static int positiveMod (int value, int modulo);
 
     juce::AudioProcessorValueTreeState apvts;
@@ -123,6 +165,26 @@ private:
 
     std::atomic<int> activeNoteBank { 0 };
     std::atomic<int> mpdLaneBank    { 0 };
+
+    // Pre-allocated drum-synthesis voice pool. Round-robin voice-stealing;
+    // zero heap growth and zero disk I/O after prepareToPlay().
+    std::array<DrumVoice, kDrumVoiceCount> drumVoices;
+    int drumVoiceRoll     = 0;
+    std::uint32_t voiceSeedCounter = 1;
+
+    // Fixed structural synthesis tuning (computed once in prepareToPlay()).
+    double kickPitchStep      = 1.0;   // exponential-pitch sweep multiplier
+    double kickAmpStep        = 1.0;   // kick amplitude decay multiplier
+    double snareNoiseAmpStep  = 1.0;
+    double snareToneAmpStep   = 1.0;
+    double snareTonePhaseInc  = 0.0;
+    double snareBP[5]         = {};    // normalized biquad band-pass (b0 b1 b2 a1 a2)
+    double hiHatAmpStep       = 1.0;
+    double hiHatHPGain        = 0.0;   // first-order high-pass feedback gain
+
+    // Continuous virtual playhead for Standalone (no host timeline): this
+    // sample-driven counter drives scheduleLanes at fallbackBpmCache tempo.
+    double internalPpqPosition = 0.0;
 
     // Persistent, absolute-sample-timestamped note-off queue (audio-thread only
     // memory; never touched by the UI thread).
